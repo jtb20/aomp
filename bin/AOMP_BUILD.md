@@ -26,6 +26,8 @@ components, the same order, but introspectable, incremental, and scriptable.
 - [Build variants](#build-variants)
 - [Components and features](#components-and-features)
 - [The version manifest](#the-version-manifest)
+- [Sharding](#sharding)
+- [TheRock backend](#therock-backend)
 - [Logs](#logs)
 - [User workflows](#user-workflows)
 - [Internals](#internals)
@@ -441,6 +443,284 @@ Manifests live under `<BUILD_DIR>/manifests/` by default
 
 ---
 
+## Sharding
+
+`--shard k/N` runs only the `k`-th of `N` slices of the build, so a large build
+can be split across machines (or across separate invocations). The flag composes
+with selectors and with the completion stamps.
+
+Because the elaborated task list is already in dependency order, each shard is a
+**contiguous segment** of that list. This is what makes the split safe: running
+shards `1..N` in order reproduces a full build, and a single shard's segment can
+run on its own machine as long as the earlier shards' outputs (the shared
+source / build / install tree) are present.
+
+```bash
+# Split the full build into four slices and run the second.
+aomp_build.py --shard 2/4
+
+# Combine with selectors: shard 1 of 3, but only the rocmlibs tasks.
+aomp_build.py 'rocmlibs/*' --shard 1/3
+```
+
+Segments are balanced by task count (the earlier shards take the remainder when
+the count does not divide evenly). The TheRock backend refines *where* the cuts
+fall so a shard boundary never splits a build stage — see below.
+
+---
+
+## TheRock backend
+
+The orchestrator is split into a backend-agnostic core (the `orchestrator`
+package) and pluggable backends. The default **aomp** backend drives the
+per-component `build_<name>.sh` scripts described throughout this document. The
+**therock** backend instead drives [TheRock](https://github.com/ROCm/TheRock)'s
+single CMake super-build, exposing the *same* workflow (resolve, order,
+elaborate, list/run/continue, log, stamp, shard, manifest).
+
+Select it with `--backend therock`, or use the dedicated entry point
+[`bin/therock_build.py`](therock_build.py) (identical, but defaulting to the
+TheRock backend):
+
+```bash
+therock_build.py list                 # numbered subproject+action task list
+therock_build.py -n                   # dry-run the whole build
+therock_build.py 'amd-llvm/*'         # just the compiler's tasks
+therock_build.py --shard 1/3          # stage-aligned shard
+```
+
+### Where the build graph comes from
+
+TheRock can emit an introspection file describing its build graph when it is
+configured with `-DTHEROCK_INTROSPECTION=ON`:
+
+```
+<TheRock>/build/subproject_map.json
+```
+
+This support lives in TheRock PR #1234 and is not yet in upstream `ROCm/TheRock`
+(which is what `setup_srock.sh` clones). The orchestrator is self-sufficient: it
+bundles the introspection module (`srock-bin/therock_subproject_introspection.cmake`)
+and, during `--reconfigure`, injects it into the checkout — copying it into
+`<TheRock>/cmake/` and appending a guarded `include()` + invocation at the end of
+the top-level `CMakeLists.txt` (idempotent, line-number-independent). The
+required internals (`therock_get_all_targets` and the `THEROCK_*` target
+properties) already exist in upstream TheRock, so this works on a stock clone.
+
+For each subproject it records the source/build directories, the build-time and
+runtime dependencies, the build pool and compiler toolchain, and the available
+ninja action targets. The backend reads this file as its component graph:
+
+- **Components** are TheRock subprojects.
+- **Dependencies** that drive ordering are the **build-time** deps
+  (`build_deps`). Runtime deps (`runtime_deps`) are recorded as metadata but do
+  *not* affect build order (they describe what a subproject needs at run time,
+  not what must be built before it).
+- **Tasks** are `subproject/<action>` for the forward pipeline actions
+  `configure`, `build`, `stage`, each running as:
+
+  ```
+  ninja -C <TheRock>/build <subproject>+<action>
+  ```
+
+  These actions depend only on a subproject's *genuine build prerequisites* (its
+  own configure→build, its build-deps' configure, and its compiler toolchain),
+  so running a subset respects real ordering without doing unrelated work.
+
+  Two actions are deliberately **excluded** from the per-subproject task list:
+
+  - `dist` — in TheRock a subproject's `+dist` target is wired into whole
+    *distribution* assembly (artifacts/distributions add themselves as its
+    dependencies), so `ninja <sub>+dist` builds unrelated subprojects across the
+    runtime-dependency graph (e.g. dist-ing a base sysdep like `bzip2` drags in
+    llvm). That is a whole-tree packaging step, not a per-component one. The
+    per-subproject `+stage` already populates the combined local dist directory
+    with this + transitive stage installs (a file copy, not extra builds), so an
+    in-order build still produces a usable staged tree. The combined dist tree
+    and the final install are produced by the **whole-tree pseudo-tasks** below.
+  - `expunge` — destructive clean; would wipe a subproject mid-build. Clean an
+    install with `-C`/`--clean`, or run `ninja <subproject>+expunge` by hand.
+
+TheRock subprojects are config-less (a single configuration is baked in at
+configure time), so tasks use the short `subproject/stage` names and the
+`--variant` filter does not apply.
+
+### Default request set (match the native build)
+
+The introspection map declares **every** subproject TheRock knows about,
+including the vendored third-party / system libraries (the `therock-*`
+projects: boost, eigen, googletest, fmt, grpc, …). A native
+`cmake --build build` does **not** build all of them — TheRock marks each
+subproject `EXCLUDE_FROM_ALL` and pulls only what it needs through its
+`therock-priority-build` / distribution targets — so requesting the literal
+full map would over-build vendored libs that nothing in the build actually
+needs.
+
+To mirror the native build, the default request is the **real ROCm components
+plus their full build- and runtime-dependency closure**:
+
+- Seed = every non-`therock-*` subproject (the real ROCm components: amd-llvm,
+  ROCR-Runtime, rocm-core, hip-clr, rocgdb, …).
+- Closure adds any subproject they need via `build_deps` *or* `runtime_deps`
+  (so genuinely-required vendored libs like `therock-simde` and
+  `therock-msgpack-cxx` are pulled in), transitively.
+- Vendored libs that no built component depends on (boost, eigen, googletest,
+  fmt, fftw, grpc, …) are **left out** of the default build.
+
+On the current minimal config this trims the default request from 36 declared
+subprojects to 19 (17 real components + the 2 vendored libs they need). The
+excluded libs stay **declared**, so you can opt any of them in explicitly:
+
+- `--add <name>` (e.g. `--add therock-boost`) — adds that lib and its deps.
+- `--add thirdparty` — a convenience feature listing **all** `therock-*`
+  vendored libs, restoring the build-everything behavior.
+
+Anything a *distribution* still requires is assembled by the whole-tree
+`therock/dist` task below regardless of the per-subproject request, so the
+final SDK is unchanged.
+
+### Whole-tree pseudo-tasks (dist + install)
+
+Because `dist`/install are whole-tree operations (not per-subproject), the
+backend appends two pseudo-tasks **after** every per-subproject task — the
+TheRock equivalents of amd-build's final "install all components":
+
+- `therock/dist` → `ninja -C <build> therock-dist` — assembles the combined
+  distribution tree under `<build>/dist` (e.g. `<build>/dist/rocm`, the complete
+  ROCm SDK). Same step CI runs as `cmake --build build --target therock-dist`.
+- `therock/install` → `ninja -C <build> install` — installs that tree to the
+  final install dir (`CMAKE_INSTALL_PREFIX` = `$SROCK_INSTALL_DIR`), exactly as
+  `srock-bin/build_srock.sh`'s `ninja install` does.
+
+They appear last in `list` and run last on a full build (build everything, then
+assemble + install). You can also run them on their own, e.g.
+`therock_build.py therock/install`.
+
+### Incremental focus (auto-pin out-of-scope components)
+
+When you build only a **subset** of subprojects (e.g. iterating on `amd-llvm`),
+the backend marks every *other* already-built component **prebuilt** before
+running, by wrapping TheRock's own `build_tools/buildctl.py`:
+
+```
+buildctl.py enable <working-set>     # working set buildable; everything else pinned
+```
+
+A `.prebuilt` marker makes CMake trust a component's existing `stage/` and skip
+its configure/build, so neither the subset build nor a later `therock/install`
+rebuilds dependents you are not working on (e.g. rebuilding `amd-llvm` won't drag
+`rocgdb` along, even though it technically depends on the compiler). This is the
+"work on one thing, don't cascade" workflow, integrated so you don't manage
+markers by hand. Only components that have actually been staged can be pinned, so
+anything not yet built stays buildable and is produced if a dependency needs it.
+
+- It triggers only for a strict, non-empty subset of subprojects (a full build,
+  or a selection of only the whole-tree pseudo-tasks, pins nothing).
+- `--unpin-all` clears all markers (`buildctl.py enable` with no args) so every
+  component builds again, then proceeds normally.
+- `--no-auto-pin` leaves markers untouched for one run.
+
+Note that `buildctl.py` reconfigures TheRock to pick up marker changes, so a
+focused subset run does a (cheap) cmake reconfigure first.
+
+### Bootstrap
+
+Generating `subproject_map.json` means a full TheRock cmake configure (which on
+first use clones the repo and fetches submodule sources). This is delegated to
+the existing `srock-bin` scripts (`srock_common_vars` / `setup_srock.sh`) rather
+than reimplemented, so the orchestrator and the two-script srock workflow stay
+consistent.
+
+- If a `subproject_map.json` already exists, it is used as-is.
+- `--reconfigure` forces a fresh configure (with `-DTHEROCK_INTROSPECTION=ON`)
+  via `setup_srock.sh`, regenerating the map.
+- A missing map without `--reconfigure` is a hard error with guidance — the
+  heavy clone/fetch/configure is never triggered implicitly by a `list` or
+  dry-run.
+
+The build is controlled by the same `SROCK_*` conventions as the srock scripts:
+`SROCK_REPOS` (set by `-s`), the install dir / symlink (`-i` → `SROCK_LINK`),
+the supplemental tools dir (`-p` → `SROCK_SUPP`), and `GFXLIST` (`--gfx`).
+`--therock-dir` overrides the TheRock checkout location.
+
+#### Build set (SROCK_CONFIG) via `--add`
+
+`-c/--config` is **not supported** for TheRock builds — passing it prints a
+warning and is ignored. The build set (`SROCK_CONFIG`) is instead a *configure
+toggle surfaced through `--add`*, with **`minimal`** as the default (no option
+needed):
+
+| `--add` toggle | `SROCK_CONFIG` | Meaning |
+|---|---|---|
+| *(none)* | `minimal` | Compiler-developer stack (default) |
+| `--add all` | `all` | Full build **minus** known-failing (MIOpen, CK, FFT off) |
+| `--add all-debug` | `all-debug` | Full build, **may include** failing components |
+
+`all-debug` wins over `all` if both are given. Toggles combine with each other
+and with normal `--add`/`--remove`, e.g. `--add all-debug,sysdeps` or
+`--add all --add rocmlibs`. Like `sysdeps`, these change the **configured**
+component set, so they only take effect at **(re)configure** time — pair them
+with `--reconfigure`:
+
+```
+./aomp_build.py --backend therock --reconfigure                 # minimal (default)
+./aomp_build.py --backend therock --add all --reconfigure       # full minus failing
+./aomp_build.py --backend therock --add all-debug,sysdeps --reconfigure
+```
+
+`--add sysdeps` toggles TheRock's bundled system dependencies
+(`THEROCK_BUNDLE_SYSDEPS`, the `therock-*` sysdep components that make the
+install self-contained and portable). The **default is off** — system libraries
+are resolved from the host. `sysdeps` is a *configure toggle surfaced through
+`--add`* rather than a normal component group: it is not a `--sysdeps` flag, you
+request it the same way you request any other extra (`--add sysdeps`,
+optionally combined like `--add sysdeps,rocmlibs`).
+
+```
+./aomp_build.py --backend therock --reconfigure              # default: no bundled sysdeps
+./aomp_build.py --backend therock --add sysdeps --reconfigure # bundle system deps
+```
+
+When set, `-DTHEROCK_BUNDLE_SYSDEPS=ON` is appended to `SROCK_CMAKE_EXTRA`
+(which srock passes to cmake last, so it wins over the config block) and emitted
+explicitly in both directions so the toggle survives CMake's cache; the bundled
+libs that real components need are then pulled into the build by the default
+request closure. Because it changes the **configured** component set, it only
+takes effect at **(re)configure** time — pair `--add sysdeps` with
+`--reconfigure` to apply it (and regenerate `subproject_map.json`).
+
+Like the aomp backend, the TheRock backend builds with an **isolated `PATH`**
+(the venv plus srock's supplemental `cmake`/`ninja` dirs are layered on top in
+environment discovery). TheRock's CMake configure discovers its build tools —
+`cmake`, `ninja`, `patchelf`, `meson` — from `PATH` via `find_program`, and the
+srock minimal config enables `THEROCK_BUNDLE_SYSDEPS`/`THEROCK_ENABLE_ROCGDB`,
+which **require `patchelf` and `meson`** on Linux. These are provided from the
+venv automatically: `srock_venv_activate` (`srock-bin/srock_common_vars`) runs
+`pip install patchelf meson` when setting up the venv, so the build is
+self-contained and needs no system packages or user prefixes. If you maintain
+those tools elsewhere, `--inherit-path` (use your `PATH`) and
+`--pass-env VAR[,VAR...]` remain available.
+
+### Stage-aligned sharding
+
+TheRock ships a static `BUILD_TOPOLOGY.toml` (parsed via its own
+`build_topology` module) describing the CI/CD build *stages* and the git
+submodules each stage needs. When that topology is available, the therock
+backend snaps `--shard` cut points to **stage boundaries** so a shard never
+splits a stage — falling back to the plain count-based split when the topology
+cannot be loaded. Tasks are never reordered; only the cut positions change.
+
+### Manifest
+
+Manifest export/import works as for the aomp backend, recording a git
+fingerprint per subproject (resolved to the enclosing submodule repository) plus
+the TheRock super-repo itself. The compiler submodules (`amd-llvm`, `hipify`,
+`spirv-llvm-translator`), which the srock workflow keeps on a moving
+`amd-staging` branch, are treated as **floating** and are not rolled back on
+import.
+
+---
+
 ## Logs
 
 Each executed task writes a numbered log:
@@ -759,3 +1039,10 @@ not inherited. Use `--inherit-path` to restore your `PATH`, and/or
   fixed and use `--add`/`--remove` at the command line.
 - **Use a different config:** `-c /path/to/other.cudf`. The manifest's default
   filename follows the config's basename.
+- **Add a backend:** implement the `Backend` interface in
+  [`bin/orchestrator/backend.py`](orchestrator/backend.py) (config loading,
+  environment, task listing, and per-task command) and register it in
+  `core.make_backend()`. The generic core (resolution, ordering, selectors,
+  execution, stamps, sharding, manifest) is reused unchanged — see the
+  [TheRock backend](orchestrator/therock_backend.py) for a worked example that
+  is driven by introspection JSON rather than per-component scripts.

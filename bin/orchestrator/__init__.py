@@ -10,6 +10,8 @@ The orchestrator is split into:
   * ``aomp_backend``     - the AOMP backend (the ``build_<name>.sh`` contract).
   * ``therock_backend``  - the TheRock backend (CMake super-build introspection).
 
-``aomp_build.py`` is a thin entry point that wires the AOMP backend into the
-core; behavior is identical to the original single-file orchestrator.
+Thin entry points wire a backend into the core: ``aomp_build.py`` defaults to
+the AOMP backend (behavior identical to the original single-file orchestrator),
+``therock_build.py`` defaults to the TheRock backend, and either accepts
+``--backend {aomp,therock}``.
 """

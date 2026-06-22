@@ -44,6 +44,11 @@ function srock_venv_activate() {
     fi
     echo "pip install -r requirements.txt"
     pip install -r requirements.txt
+    # TheRock's THEROCK_BUNDLE_SYSDEPS / THEROCK_ENABLE_ROCGDB configure checks
+    # require patchelf and meson on Linux. Provide them from the venv so the
+    # build is self-contained (no system packages or user prefixes needed).
+    echo "pip install patchelf meson"
+    pip install patchelf meson
     export PATH=$SROCK_THEROCK_DIR/$SROCK_VENV/bin:$PATH
 }
 

@@ -27,18 +27,21 @@ from __future__ import annotations
 import sys
 
 from orchestrator import core
-from orchestrator.aomp_backend import DEFAULT_CHILD_PATH, DEFAULT_CONFIG, AompBackend
+from orchestrator.aomp_backend import DEFAULT_CHILD_PATH, DEFAULT_CONFIG
 
 
 def main(argv: list[str]) -> int:
     core.PROG = "aomp_build"
     parser = core.build_arg_parser(
         "aomp_build.py", DEFAULT_CONFIG,
-        description="Unified AOMP component build orchestrator.",
+        description="Unified AOMP component build orchestrator. "
+                    "Use --backend therock to drive TheRock's CMake super-build "
+                    "instead (see therock_build.py).",
         inherit_path_note=DEFAULT_CHILD_PATH,
     )
+    core.add_backend_options(parser, default_backend="aomp")
     args = parser.parse_args(argv)
-    return core.run(args, AompBackend())
+    return core.run(args, core.make_backend(args))
 
 
 if __name__ == "__main__":
