@@ -980,6 +980,14 @@ class TailLastLineTests(unittest.TestCase):
             self.assertEqual(core.tail_last_line(p, maxbytes=64), "tail-line")
 
 
+class FmtElapsedTests(unittest.TestCase):
+    def test_formats(self) -> None:
+        self.assertEqual(core._fmt_elapsed(0), "0s")
+        self.assertEqual(core._fmt_elapsed(45), "45s")
+        self.assertEqual(core._fmt_elapsed(123), "2m03s")
+        self.assertEqual(core._fmt_elapsed(3600 + 7 * 60), "1h07m")
+
+
 class RunWithProgressTests(unittest.TestCase):
     def test_live_tail_updates_status(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1007,6 +1015,25 @@ class RunWithProgressTests(unittest.TestCase):
                 "compiling foo.cpp" in out or "linking libfoo" in out,
                 msg=f"status output did not include a log line: {out!r}",
             )
+            # An elapsed clock is shown, and the line is cleared on completion.
+            self.assertRegex(out, r"\[\d+s\]")
+            self.assertFalse(status.active)
+
+    def test_clock_ticks_while_log_is_quiet(self) -> None:
+        # A process that writes nothing should still produce a ticking elapsed
+        # clock (so a quiet-but-working step never looks frozen/hung).
+        with tempfile.TemporaryDirectory() as d:
+            log_path = os.path.join(d, "build.log")
+            buf = TtyStream()
+            status = core.StatusLine(buf)
+            with open(log_path, "w", encoding="utf-8") as log:
+                rc = core.run_with_progress(
+                    [sys.executable, "-c", "import time; time.sleep(1.2)"],
+                    dict(os.environ), log, log_path, status, poll=0.05,
+                )
+            self.assertEqual(rc, 0)
+            # At least one elapsed-clock draw happened despite an empty log.
+            self.assertRegex(buf.getvalue(), r"\[\d+s\]")
 
     def test_returns_nonzero_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as d:

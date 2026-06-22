@@ -856,19 +856,21 @@ fixing the problem.
 ### Progress line
 
 When stdout is a terminal, an ephemeral mid-grey status line is drawn at the
-bottom while each task runs, live-updated with the clipped last line of that
-task's log (two-space indented) so you can watch the build move:
+bottom while each task runs, showing a live elapsed clock plus the clipped last
+line of that task's log (two-space indented) so you can watch the build move:
 
 ```
-  [ 47%] Building CXX object lib/.../Foo.cpp.o
+  [2m03s] [ 47%] Building CXX object lib/.../Foo.cpp.o
 ```
 
-The text is the current tail of `aomp_build_logs/NNN-<task>.log`, polled at most
-~10 times per second and only redrawn when the log actually grows, so a quiet
-build does no extra I/O. The line is transient: it is erased before the next
-task's header is printed, before a failure tail, and when the build finishes. It
-is never emitted when stdout is not a TTY (pipe, file, CI log), so captured
-output stays free of carriage returns and ANSI escapes.
+The trailing text is the current tail of `aomp_build_logs/NNN-<task>.log`,
+polled ~10 times per second and redrawn when that line changes. The clock keeps
+ticking (redrawn ~once a second) even when the log is quiet, so a step that
+produces no output for a while -- e.g. a long compile whose output has not yet
+flushed to the log -- never looks hung. The line is transient: it is cleared the
+moment the task finishes, before the next task's header is printed, and before a
+failure tail. It is never emitted when stdout is not a TTY (pipe, file, CI log),
+so captured output stays free of carriage returns and ANSI escapes.
 
 ### Completion stamps
 
