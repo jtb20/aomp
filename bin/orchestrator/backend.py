@@ -90,6 +90,22 @@ class Backend(ABC):
         """The -C/--clean pseudo-task (wipe install dir), or None if unsupported."""
         return None
 
+    def list_features(self, env: dict[str, str]) -> list[dict] | None:
+        """Rows for the `list-features` selector, or None if the backend has no
+        feature concept. Each row is a dict with at least 'name' and 'enabled';
+        the TheRock backend lists its THEROCK_ENABLE_* features. Default: None."""
+        return None
+
+    def built_components(self, env: dict[str, str]) -> set[str] | None:
+        """Components the backend considers already built (so they can be pinned
+        / shown as done), or None if the backend has no such notion.
+
+        The TheRock backend returns the components with a valid (non-empty)
+        stage dir -- i.e. exactly the ones buildctl.py would mark prebuilt.
+        `list` uses this to show a [pinned] suffix and to render an already-built
+        component's checkbox as done. Default: None (e.g. the AOMP backend)."""
+        return None
+
     def prepare_run(
         self, selected_comps: set[str], env: dict[str, str],
         args: argparse.Namespace,

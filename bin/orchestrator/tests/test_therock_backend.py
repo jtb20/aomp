@@ -339,6 +339,235 @@ class DefaultRequestTest(unittest.TestCase):
         self.assertIn("therock-boost", components)
 
 
+class FeatureSelectionTest(unittest.TestCase):
+    """THEROCK_ENABLE_* feature selection via --add + the feature catalog."""
+
+    FEATURE_FIXTURE = {
+        "HIPDNN": {
+            "enabled": False, "description": "Enables hipdnn", "feature": True,
+            "requires": ["CORE_RUNTIME", "HIP_RUNTIME"],
+        },
+        "ML_LIBS": {
+            "enabled": False, "description": "Enable building of ML libraries",
+            "feature": False, "requires": [],
+        },
+        "COMPILER": {
+            "enabled": True, "description": "Enable building of the compiler",
+            "feature": True, "requires": [],
+        },
+    }
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-feat-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+        with open(os.path.join(self.build, "feature_map.json"), "w") as fh:
+            json.dump(self.FEATURE_FIXTURE, fh)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _backend_env(self, *selectors: str):
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, *selectors)
+        env = backend.build_child_env(args)
+        info = backend.discover_env(env)
+        return backend, args, env, info
+
+    def test_add_feature_with_reconfigure_appends_enable_flag(self) -> None:
+        backend, args, env, info = self._backend_env(
+            "--add", "hipdnn", "--reconfigure", "list",
+        )
+        backend._apply_feature_flags(env, info, args)
+        self.assertIn("-DTHEROCK_ENABLE_HIPDNN=ON", env["SROCK_CMAKE_EXTRA"])
+
+    def test_feature_token_is_normalized(self) -> None:
+        # `ml-libs` -> THEROCK_ENABLE_ML_LIBS.
+        backend, args, env, info = self._backend_env(
+            "--add", "ml-libs", "--reconfigure", "list",
+        )
+        backend._apply_feature_flags(env, info, args)
+        self.assertIn("-DTHEROCK_ENABLE_ML_LIBS=ON", env["SROCK_CMAKE_EXTRA"])
+
+    def test_disabled_feature_without_reconfigure_fails(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "--add", "hipdnn", "list")
+        with self.assertRaises(SystemExit):
+            backend.load_config(args)
+
+    def test_enabled_feature_without_reconfigure_ok(self) -> None:
+        # COMPILER is already enabled, so requesting it needs no reconfigure and
+        # no enable flag is appended.
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "--add", "compiler", "list")
+        cfg = backend.load_config(args)
+        self.assertNotIn(
+            "-DTHEROCK_ENABLE_COMPILER=ON",
+            backend.build_child_env(args).get("SROCK_CMAKE_EXTRA", ""),
+        )
+        # Feature tokens (and their spellings) are recognized by resolve_components.
+        self.assertIn("compiler", cfg.features)
+        self.assertIn("ml-libs", cfg.features)
+        core.resolve_components(cfg, ["hipdnn", "ml-libs"], [])
+
+    def test_list_features_rows(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list-features")
+        backend.load_config(args)
+        rows = backend.list_features(backend.build_child_env(args))
+        by_name = {r["name"]: r for r in rows}
+        self.assertFalse(by_name["HIPDNN"]["enabled"])
+        self.assertEqual(
+            by_name["HIPDNN"]["requires"], ["CORE_RUNTIME", "HIP_RUNTIME"]
+        )
+        self.assertTrue(by_name["COMPILER"]["enabled"])
+
+    def test_no_feature_map_yields_empty_catalog(self) -> None:
+        # A configure that predates feature_map.json: list_features is empty,
+        # and feature tokens are simply not registered.
+        os.remove(os.path.join(self.build, "feature_map.json"))
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        backend.load_config(args)
+        self.assertEqual(backend.list_features(backend.build_child_env(args)), [])
+
+
+class GfxNormalizeTest(unittest.TestCase):
+    """--gfx accepts comma- and/or space-separated targets -> GFXLIST form."""
+
+    def test_normalizes_to_space_separated(self) -> None:
+        self.assertEqual(
+            core.normalize_gfx_list("gfx90a,gfx942"), "gfx90a gfx942"
+        )
+        self.assertEqual(
+            core.normalize_gfx_list("gfx90a gfx942"), "gfx90a gfx942"
+        )
+        # Mixed separators and extra whitespace collapse to single spaces.
+        self.assertEqual(
+            core.normalize_gfx_list(" gfx90a , gfx942,gfx1100 "),
+            "gfx90a gfx942 gfx1100",
+        )
+
+    def test_applied_by_arg_parser(self) -> None:
+        # Parsing doesn't touch the filesystem; dummy dirs are fine here.
+        args = make_args("/x", "/y", "--gfx", "gfx90a,gfx942", "list")
+        self.assertEqual(args.gfx, "gfx90a gfx942")
+
+
+class BuildTypeTest(unittest.TestCase):
+    """--build-type -> TheRock configure-time -D flags (requires --reconfigure)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-bt-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_cache(self, entries: dict[str, str]) -> None:
+        with open(os.path.join(self.build, "CMakeCache.txt"), "w") as fh:
+            fh.write("# CMakeCache test fixture\n")
+            for name, value in entries.items():
+                fh.write(f"{name}:STRING={value}\n")
+
+    def _apply(self, *flags: str):
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, *flags, "list")
+        env = backend.build_child_env(args)
+        backend._apply_build_type_flags(env, {"BUILD_DIR": self.build}, args)
+        return env
+
+    def test_reconfigure_appends_global_and_per_comp_flags(self) -> None:
+        # No (matching) cache -> these are real changes; --reconfigure applies.
+        env = self._apply(
+            "--reconfigure", "--build-type", "Release",
+            "--build-type", "amd-llvm=Debug",
+        )
+        extra = env["SROCK_CMAKE_EXTRA"]
+        self.assertIn("-DCMAKE_BUILD_TYPE=Release", extra)
+        self.assertIn("-Damd-llvm_BUILD_TYPE=Debug", extra)
+
+    def test_change_without_reconfigure_is_an_error(self) -> None:
+        # Cache is Debug; requesting Release is a change -> needs --reconfigure.
+        self._write_cache({"CMAKE_BUILD_TYPE": "Debug"})
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "--build-type", "Release", "list")
+        env = backend.build_child_env(args)
+        with self.assertRaises(SystemExit):
+            backend._apply_build_type_flags(env, {"BUILD_DIR": self.build}, args)
+
+    def test_matching_cache_is_idempotent_noop(self) -> None:
+        # Requested values already match the cache -> no error, no flags, even
+        # without --reconfigure (safe to leave --build-type on the command line).
+        self._write_cache(
+            {"CMAKE_BUILD_TYPE": "Release", "amd-llvm_BUILD_TYPE": "Debug"}
+        )
+        env = self._apply(
+            "--build-type", "Release", "--build-type", "amd-llvm=Debug",
+        )
+        self.assertNotIn("-DCMAKE_BUILD_TYPE", env["SROCK_CMAKE_EXTRA"])
+        self.assertNotIn("_BUILD_TYPE", env["SROCK_CMAKE_EXTRA"])
+
+    def test_dropping_per_comp_override_is_a_change(self) -> None:
+        # Cache still carries a per-component override but the command line no
+        # longer asks for it -> the scope must revert to the default (Release),
+        # which is a change and needs --reconfigure.
+        self._write_cache({"amd-llvm_BUILD_TYPE": "Debug"})
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")  # no --build-type
+        env = backend.build_child_env(args)
+        with self.assertRaises(SystemExit):
+            backend._apply_build_type_flags(env, {"BUILD_DIR": self.build}, args)
+
+    def test_dropping_per_comp_override_reverts_to_default_on_reconfigure(self) -> None:
+        self._write_cache({"amd-llvm_BUILD_TYPE": "Debug"})
+        env = self._apply("--reconfigure")  # no --build-type
+        self.assertIn("-Damd-llvm_BUILD_TYPE=Release", env["SROCK_CMAKE_EXTRA"])
+
+    def test_no_overrides_no_request_is_noop(self) -> None:
+        # The common case: no --build-type and no cached overrides -> nothing to
+        # do, no error, no build-type flags (clean trees are unaffected).
+        self._write_cache({"CMAKE_BUILD_TYPE": "Release"})
+        env = self._apply()  # no --build-type, no --reconfigure
+        self.assertNotIn("_BUILD_TYPE", env["SROCK_CMAKE_EXTRA"])
+
+    def test_partial_change_against_cache_needs_reconfigure(self) -> None:
+        # Global matches but a per-comp differs -> still a change -> error.
+        self._write_cache(
+            {"CMAKE_BUILD_TYPE": "Release", "amd-llvm_BUILD_TYPE": "Release"}
+        )
+        backend = TheRockBackend()
+        args = make_args(
+            self.therock, self.repos, "--build-type", "Release",
+            "--build-type", "amd-llvm=Debug", "list",
+        )
+        env = backend.build_child_env(args)
+        with self.assertRaises(SystemExit):
+            backend._apply_build_type_flags(env, {"BUILD_DIR": self.build}, args)
+
+    def test_unknown_component_warns(self) -> None:
+        backend = TheRockBackend()
+        cfg = backend.load_config(make_args(self.therock, self.repos, "list"))
+        args = make_args(
+            self.therock, self.repos, "--reconfigure",
+            "--build-type", "nope=Debug", "list",
+        )
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            backend._warn_unknown_build_type_comps(cfg, args)
+        self.assertIn("nope", buf.getvalue())
+        self.assertIn("not a known subproject", buf.getvalue())
+
+
 class PrepareRunTest(unittest.TestCase):
     """Auto-pin / unpin wiring around buildctl.py (dry-run, no real build)."""
 
@@ -404,6 +633,177 @@ class PrepareRunTest(unittest.TestCase):
         self.assertIn("buildctl.py enable --build-dir", out)
         # A bare 'enable' (no patterns) clears all markers.
         self.assertNotIn("/stage$", out)
+
+
+def _make_stage(build: str, relpath: str, empty: bool = False) -> None:
+    """Create a (by default non-empty) stage dir under build at relpath."""
+    stage = os.path.join(build, *relpath.split("/"))
+    os.makedirs(stage, exist_ok=True)
+    if not empty:
+        open(os.path.join(stage, "marker"), "w").close()
+
+
+# Stage relpaths derived from the FIXTURE bin paths (build -> stage sibling).
+STAGE_RELPATHS = {
+    "amd-llvm": "compiler/amd-llvm/stage",
+    "rocm-cmake": "base/rocm-cmake/stage",
+    "hipBLAS": "math-libs/BLAS/hipBLAS/stage",
+}
+
+
+class BuiltComponentsTest(unittest.TestCase):
+    """built_components() reports comps with a valid (non-empty) stage dir."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-built-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_only_valid_stage_dirs_count_as_built(self) -> None:
+        _make_stage(self.build, STAGE_RELPATHS["amd-llvm"])
+        _make_stage(self.build, STAGE_RELPATHS["rocm-cmake"])
+        # hipBLAS has an *empty* stage dir -> not built; (no dir is also not).
+        _make_stage(self.build, STAGE_RELPATHS["hipBLAS"], empty=True)
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        backend.load_config(args)
+        built = backend.built_components(backend.build_child_env(args))
+        self.assertEqual(built, {"amd-llvm", "rocm-cmake"})
+
+
+class ReverseDepClosureTest(unittest.TestCase):
+    """reverse_dep_closure walks dependents over the build-dep graph."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-rdep-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+        backend = TheRockBackend()
+        self.cfg = backend.load_config(make_args(self.therock, self.repos, "list"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_closure_pulls_in_transitive_dependents(self) -> None:
+        # Graph: rocm-cmake <- amd-llvm <- hipBLAS (hipBLAS also <- rocm-cmake).
+        self.assertEqual(
+            core.reverse_dep_closure(self.cfg, {"rocm-cmake"}),
+            {"rocm-cmake", "amd-llvm", "hipBLAS"},
+        )
+        self.assertEqual(
+            core.reverse_dep_closure(self.cfg, {"amd-llvm"}),
+            {"amd-llvm", "hipBLAS"},
+        )
+        self.assertEqual(
+            core.reverse_dep_closure(self.cfg, {"hipBLAS"}), {"hipBLAS"}
+        )
+
+
+class RdepsRunTest(unittest.TestCase):
+    """--rdeps expands a subset run to its dependents (dry-run, via core.run)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-rdeps-run-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        os.makedirs(os.path.join(self.therock, "build_tools"))
+        open(os.path.join(self.therock, "build_tools", "buildctl.py"), "w").close()
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *selectors: str) -> str:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "-n", *selectors)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            core.run(args, backend)
+        return buf.getvalue()
+
+    def test_rdeps_rebuilds_dependents(self) -> None:
+        out = self._run("--rdeps", "amd-llvm/build")
+        # hipBLAS depends on amd-llvm, so the auto-pin working set now includes
+        # it (focusing on 2 components) and its tasks are scheduled.
+        self.assertIn("hipBLAS", out)
+        self.assertIn("amd-llvm", out)
+
+    def test_without_rdeps_dependents_are_pinned(self) -> None:
+        out = self._run("amd-llvm/build")
+        # Only amd-llvm builds; hipBLAS is left out (pinned), not named anywhere.
+        self.assertNotIn("hipBLAS", out)
+
+
+class ListPinnedTest(unittest.TestCase):
+    """`list` shows [pinned] for built comps outside the previewed set."""
+
+    CHECK = "\u2713"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-listpin-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+        for rel in STAGE_RELPATHS.values():  # every comp is built
+            _make_stage(self.build, rel)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _list(self, *preview: str, rdeps: bool = False) -> dict[str, str]:
+        backend = TheRockBackend()
+        flags = ("--rdeps",) if rdeps else ()
+        # Optional flags must precede the positional selectors for argparse.
+        args = make_args(self.therock, self.repos, *flags, "list", *preview)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            core.run(args, backend)
+        # Map component -> its first task line for easy assertions.
+        rows: dict[str, str] = {}
+        for line in buf.getvalue().splitlines():
+            for comp in FIXTURE:
+                if f"] {comp}/" in line and comp not in rows:
+                    rows[comp] = line
+        return rows
+
+    def test_preview_marks_excluded_built_comps_pinned(self) -> None:
+        rows = self._list("amd-llvm")
+        self.assertNotIn("[pinned]", rows["amd-llvm"])
+        # rocm-cmake (a dep) and hipBLAS (a dependent) are both built + outside
+        # the focused set -> pinned.
+        self.assertIn("[pinned]", rows["rocm-cmake"])
+        self.assertIn("[pinned]", rows["hipBLAS"])
+        # Built comps render with a done check, never blank-and-pinned.
+        self.assertIn(self.CHECK, rows["hipBLAS"])
+
+    def test_full_list_pins_nothing(self) -> None:
+        rows = self._list()
+        for line in rows.values():
+            self.assertNotIn("[pinned]", line)
+
+    def test_rdeps_preview_unpins_dependents(self) -> None:
+        rows = self._list("amd-llvm", rdeps=True)
+        # With --rdeps the dependent hipBLAS joins the build set (not pinned);
+        # the forward dep rocm-cmake stays pinned.
+        self.assertNotIn("[pinned]", rows["hipBLAS"])
+        self.assertIn("[pinned]", rows["rocm-cmake"])
 
 
 class InjectIntrospectionTest(unittest.TestCase):
@@ -516,6 +916,108 @@ class TopologyShardTest(unittest.TestCase):
         # Runs are contiguous and cover exactly the task list.
         self.assertEqual(sum(runs), len(tasks))
         self.assertTrue(all(r > 0 for r in runs))
+
+
+class TtyStream(io.StringIO):
+    """A StringIO that claims to be a TTY, for exercising StatusLine output."""
+
+    def isatty(self) -> bool:  # noqa: D401 - simple override
+        return True
+
+
+class StatusLineTests(unittest.TestCase):
+    def test_noop_on_non_tty(self) -> None:
+        # A plain StringIO is not a TTY: show()/clear() must write nothing so
+        # piped/CI output stays free of carriage returns and ANSI escapes.
+        buf = io.StringIO()
+        status = core.StatusLine(buf)
+        self.assertFalse(status.enabled)
+        status.show("  Building amd-llvm [1/3] 33%")
+        status.clear()
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_show_and_clear_on_tty(self) -> None:
+        buf = TtyStream()
+        status = core.StatusLine(buf)
+        self.assertTrue(status.enabled)
+        status.show("  Building amd-llvm [1/3] 33%")
+        out = buf.getvalue()
+        # Mid-grey ANSI colour, the text, a reset, and an erase-line sequence.
+        self.assertIn("\033[38;5;244m", out)
+        self.assertIn("Building amd-llvm [1/3] 33%", out)
+        self.assertIn("\033[0m", out)
+        self.assertIn("\033[2K", out)
+        self.assertTrue(status.active)
+        status.clear()
+        self.assertFalse(status.active)
+        # clear() emits another erase sequence after the shown line.
+        self.assertEqual(buf.getvalue().count("\033[2K"), 2)
+
+    def test_clear_without_show_is_noop(self) -> None:
+        buf = TtyStream()
+        status = core.StatusLine(buf)
+        status.clear()
+        self.assertEqual(buf.getvalue(), "")
+
+
+class TailLastLineTests(unittest.TestCase):
+    def test_returns_last_non_empty_line(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.log")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("first\nsecond\nthird\n\n  \n")
+            self.assertEqual(core.tail_last_line(p), "third")
+
+    def test_missing_file_returns_empty(self) -> None:
+        self.assertEqual(core.tail_last_line("/no/such/file.log"), "")
+
+    def test_only_reads_trailing_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.log")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("A" * 100000 + "\n")
+                f.write("tail-line\n")
+            self.assertEqual(core.tail_last_line(p, maxbytes=64), "tail-line")
+
+
+class RunWithProgressTests(unittest.TestCase):
+    def test_live_tail_updates_status(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log_path = os.path.join(d, "build.log")
+            buf = TtyStream()
+            status = core.StatusLine(buf)
+            # A command that writes two lines with a pause so the poll loop has
+            # a chance to observe the growing log and update the status line.
+            script = (
+                "import sys, time\n"
+                "print('compiling foo.cpp', flush=True)\n"
+                "time.sleep(0.25)\n"
+                "print('linking libfoo', flush=True)\n"
+                "time.sleep(0.25)\n"
+            )
+            with open(log_path, "w", encoding="utf-8") as log:
+                rc = core.run_with_progress(
+                    [sys.executable, "-c", script], dict(os.environ),
+                    log, log_path, status, poll=0.05,
+                )
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            # The status line should have surfaced at least one log line.
+            self.assertTrue(
+                "compiling foo.cpp" in out or "linking libfoo" in out,
+                msg=f"status output did not include a log line: {out!r}",
+            )
+
+    def test_returns_nonzero_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log_path = os.path.join(d, "build.log")
+            status = core.StatusLine(io.StringIO())  # non-TTY: no draws
+            with open(log_path, "w", encoding="utf-8") as log:
+                rc = core.run_with_progress(
+                    [sys.executable, "-c", "import sys; sys.exit(3)"],
+                    dict(os.environ), log, log_path, status, poll=0.05,
+                )
+            self.assertEqual(rc, 3)
 
 
 if __name__ == "__main__":

@@ -116,7 +116,8 @@ aomp_build.py [options] [selector ...]
 
 | Option | Description |
 |--------|-------------|
-| `list` (selector) | Print the numbered task list and exit (`[NNN] [✓] component/stage`; the tick marks completed tasks, see [Completion stamps](#completion-stamps)). |
+| `list` (selector) | Print the numbered task list and exit (`[NNN] [✓] component/stage`; the tick marks completed tasks, see [Completion stamps](#completion-stamps)). Trailing selectors preview a focused build: `list amd-llvm` marks every other already-built component `[pinned]` (TheRock only, see [Incremental focus](#incremental-focus-auto-pin-out-of-scope-components)). |
+| `list-features` (selector) | Print the backend's configurable features and exit (TheRock only: the `THEROCK_ENABLE_*` flags, with ✓/✗ enabled state). Enable one with `--add <name> --reconfigure`. |
 | `--components` | Print the resolved, dependency-ordered component list and exit. |
 | `-n`, `--dry-run` | Show what would run (command + log path per task) without executing. |
 | `--export-manifest [FILE]` | Write a git fingerprint manifest and exit. Default path: `<BUILD_DIR>/manifests/<config>-manifest.json`. |
@@ -151,7 +152,7 @@ child scripts, so they resolve identically regardless of working directory.
 | `-j`, `--jobs N` | `AOMP_JOB_THREADS` | Parallel build threads. |
 | `--ninja` / `--no-ninja` | `AOMP_USE_NINJA=1` / `0` | Use the Ninja generator. |
 | `--ccache` / `--no-ccache` | `AOMP_USE_CCACHE=1` / `0` | Use ccache. |
-| `--gfx LIST` | `GFXLIST` | GPU target list. |
+| `--gfx LIST` | `GFXLIST` | GPU target list; comma- or space-separated (e.g. `gfx90a,gfx942`), normalized to the space-separated `GFXLIST` form. |
 | `--build-type SPEC` | `BUILD_TYPE` | CMake build type; global or per-component (see below). |
 | `--sudo` | `SUDO=yes` | Install with sudo. |
 
@@ -166,6 +167,40 @@ environment variable at execution time (it does not affect other components):
 ./aomp_build.py --build-type project=Debug,comgr=Debug # per-component
 ./aomp_build.py --build-type Release,project=Debug     # global Release, project Debug
 ```
+
+For the **TheRock** backend, build types are not an execution-time env var:
+TheRock gates them at *configure* time via cmake cache variables. The
+orchestrator therefore translates `--build-type` into `-D` flags on the
+configure (`SROCK_CMAKE_EXTRA`) -- a bare value becomes `-DCMAKE_BUILD_TYPE=<T>`
+and `comp=type` becomes `-D<comp>_BUILD_TYPE=<T>` (the component name is the
+subproject name, e.g. `-Damd-llvm_BUILD_TYPE=Debug`).
+
+The desired state is compared against the **current `CMakeCache.txt`**, so it is
+idempotent: if every value already matches the configured cache it is a no-op,
+and you can leave `--build-type` on the command line across incremental builds
+with no `--reconfigure`. An **unset** build type defaults to `Release` rather
+than retaining whatever is cached, so *dropping* a previously-set `--build-type`
+reverts that scope to the default -- which is itself a configuration change.
+Only a value that actually *changes* the configuration needs `--reconfigure`
+(build types take hold at configure time); requesting a change without it is a
+hard error naming the differing settings:
+
+```bash
+# Set a per-component type (reconfigures to apply).
+therock_build.py --reconfigure --build-type ROCR-Runtime=Debug ROCR-Runtime/build
+
+# Keep it on the command line -> no-op, no --reconfigure needed.
+therock_build.py --build-type ROCR-Runtime=Debug ROCR-Runtime/build
+
+# Drop it -> ROCR-Runtime reverts to the Release default, which is a change:
+#   error unless --reconfigure is given.
+therock_build.py --reconfigure ROCR-Runtime/build
+```
+
+Scopes that are neither requested nor already present in the cache are left
+unmanaged (a fresh tree keeps TheRock's own default). A `comp=type` whose
+component is not a known subproject is warned about (the `-D<comp>_BUILD_TYPE`
+flag would have no effect), but is not fatal.
 
 ### Environment isolation
 
@@ -221,7 +256,8 @@ run. The grammar mirrors `amd-build`:
 | Selector | Meaning |
 |----------|---------|
 | *(none)* | Run all elaborated tasks. |
-| `list` | Print the numbered task list and exit (does not run anything). |
+| `list` | Print the numbered task list and exit (does not run anything). Trailing selectors preview a focused build, marking out-of-scope built components `[pinned]` (TheRock). |
+| `list-features` | Print the backend's configurable features and exit (TheRock: the `THEROCK_ENABLE_*` flags). Does not run anything. |
 | `N` | Run task number `N` (1-based, as shown by `list`). |
 | `N--M` | Run the inclusive range of tasks `N` through `M`. |
 | `comp/variant/stage` | Glob/substring match on task names; supports `{a,b}` brace expansion. |
@@ -579,6 +615,53 @@ Anything a *distribution* still requires is assembled by the whole-tree
 `therock/dist` task below regardless of the per-subproject request, so the
 final SDK is unchanged.
 
+### Selecting build features (`THEROCK_ENABLE_*`)
+
+Which subprojects even *exist* in the introspection map is decided by TheRock's
+own configure-time **feature** flags — the `THEROCK_ENABLE_*` cache variables
+(coarse group options like `THEROCK_ENABLE_ML_LIBS`, and per-artifact features
+like `THEROCK_ENABLE_HIPDNN`). A component gated off by a disabled feature does
+not appear in `subproject_map.json` at all, so it cannot be selected with `--add
+<subproject>` until the feature that produces it is turned on.
+
+The backend exposes these features as `--add` tokens. During introspection it
+emits a companion `feature_map.json` next to `subproject_map.json` cataloging
+every `THEROCK_ENABLE_*` flag (its enabled state, description, and `requires`
+list), and surfaces them as selectable tokens:
+
+```
+therock_build.py list-features          # list every feature + on/off state
+```
+
+`list-features` prints one row per feature, a green check (✓) for enabled and a
+red cross (✗) for disabled, with its `requires` dependencies and description.
+
+To turn a feature on, name it with `--add` (case-insensitive; dashes and
+underscores are interchangeable, so `hipdnn`, `HIPDNN`, and `ml-libs` all work)
+**together with `--reconfigure`**:
+
+```
+therock_build.py --add hipdnn --reconfigure list   # enable HIPDNN, then list
+```
+
+`--reconfigure` is required because features are configure-time gates: the
+backend appends `-DTHEROCK_ENABLE_<NAME>=ON` to the cmake invocation and lets
+TheRock reconfigure, which is what makes the newly-enabled subprojects show up
+in the regenerated map. Requesting a feature that is **not** already enabled
+*without* `--reconfigure` is a hard error (a reconfigure would otherwise be
+needed to honor it, and silently ignoring the request would be misleading):
+
+```
+therock_build.py --add hipdnn list
+# error: requested feature(s) not enabled in the current TheRock
+#        configuration: hipdnn.
+#          Re-run with --reconfigure to apply them (...).
+```
+
+Requesting a feature that is already enabled is a no-op (no flag appended, no
+reconfigure forced), so `--add <feature>` is safe to leave in a command line
+across incremental builds.
+
 ### Whole-tree pseudo-tasks (dist + install)
 
 Because `dist`/install are whole-tree operations (not per-subproject), the
@@ -616,12 +699,41 @@ anything not yet built stays buildable and is produced if a dependency needs it.
 
 - It triggers only for a strict, non-empty subset of subprojects (a full build,
   or a selection of only the whole-tree pseudo-tasks, pins nothing).
+- `--rdeps` rebuilds the **reverse-dependency closure** of the subset instead of
+  pinning it: with `amd-llvm --rdeps`, every component that (transitively)
+  depends on `amd-llvm` (e.g. `rocgdb`) is pulled into the build and rebuilt,
+  and only the remaining built components are pinned. Forward dependencies the
+  subset *needs* (e.g. `rocm-cmake`) are still left prebuilt either way.
 - `--unpin-all` clears all markers (`buildctl.py enable` with no args) so every
   component builds again, then proceeds normally.
 - `--no-auto-pin` leaves markers untouched for one run.
 
 Note that `buildctl.py` reconfigures TheRock to pick up marker changes, so a
 focused subset run does a (cheap) cmake reconfigure first.
+
+#### Previewing pins with `list`
+
+`list` can preview which components a focused build would pin. Trailing
+selectors after `list` are treated as the focused set; every already-built
+component **outside** that set is shown with a `[pinned]` suffix:
+
+```
+therock_build.py list amd-llvm
+[01] [✓] rocm-cmake/configure   [pinned]
+...
+[07] [✓] amd-llvm/build
+...
+[12] [✓] hipBLAS/build          [pinned]
+```
+
+A component is reported `[pinned]` only when it has a valid (built) TheRock
+`stage/` dir — exactly the components `buildctl.py` would mark prebuilt. The
+checkbox reflects TheRock's build state too: a component with a valid stage dir
+renders as done (`[✓]`) even if this orchestrator never ran its task, so a
+`[pinned]` row is never blank. `--rdeps` applies to the preview as well (place flags before the
+selectors, e.g. `therock_build.py --rdeps list amd-llvm`): the dependents then
+show as buildable rather than `[pinned]`. A bare `list` (no trailing selectors)
+previews a full build and pins nothing.
 
 ### Bootstrap
 
@@ -740,6 +852,23 @@ timestamp and the return code.
 On failure, the orchestrator prints the failing task and tails the log to
 stderr, then stops (non-zero exit). Re-run with `<failed-task> continue` after
 fixing the problem.
+
+### Progress line
+
+When stdout is a terminal, an ephemeral mid-grey status line is drawn at the
+bottom while each task runs, live-updated with the clipped last line of that
+task's log (two-space indented) so you can watch the build move:
+
+```
+  [ 47%] Building CXX object lib/.../Foo.cpp.o
+```
+
+The text is the current tail of `aomp_build_logs/NNN-<task>.log`, polled at most
+~10 times per second and only redrawn when the log actually grows, so a quiet
+build does no extra I/O. The line is transient: it is erased before the next
+task's header is printed, before a failure tail, and when the build finishes. It
+is never emitted when stdout is not a TTY (pipe, file, CI log), so captured
+output stays free of carriage returns and ANSI escapes.
 
 ### Completion stamps
 
