@@ -435,34 +435,72 @@ def tail_last_line(path: str, maxbytes: int = 8192) -> str:
     return ""
 
 
+def _fmt_elapsed(secs: float) -> str:
+    """Compact elapsed time: '45s', '2m03s', '1h07m'."""
+    s = int(secs)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
 def run_with_progress(
     cmd: list[str], env: dict[str, str], log, log_path: str,
     status: "StatusLine", poll: float = 0.1,
 ) -> int:
     """Run `cmd` (stdout+stderr -> the open file `log`) while updating `status`
-    with the clipped last line of the growing log (two-space indented).
+    with the clipped last line of the growing log, prefixed by a live elapsed
+    clock: ``  [2m03s] <last log line>`` (two-space indented).
 
-    Polls at most every `poll` seconds (~10 Hz) and only redraws when the log
-    has actually grown and its last line changed, so an idle/quiet build does no
-    extra terminal I/O. Returns the process return code."""
+    The line is redrawn when the log gains a new last line, and at least once a
+    second so the clock keeps ticking -- a quiet-but-still-working step (e.g. a
+    long compile whose output has not yet flushed to the log) never looks hung.
+    Completion is detected immediately via wait(), and the transient line is
+    cleared the moment the task finishes. Returns the process return code."""
     proc = subprocess.Popen(
         cmd, stdout=log, stderr=subprocess.STDOUT, env=env
     )
-    last_line: str | None = None
+    # No TTY -> nothing to draw; just wait (and reap) the process.
+    if not status.enabled:
+        return proc.wait()
+    start = time.monotonic()
+    last_line = ""
     last_size = -1
-    while proc.poll() is None:
-        try:
-            size = os.path.getsize(log_path)
-        except OSError:
-            size = last_size
-        if size != last_size:
-            last_size = size
-            line = tail_last_line(log_path)
-            if line and line != last_line:
-                last_line = line
-                status.show(f"  {line}")
-        time.sleep(poll)
-    return proc.returncode
+    last_draw = -1.0
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=poll)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            changed = False
+            try:
+                size = os.path.getsize(log_path)
+            except OSError:
+                size = last_size
+            if size != last_size:
+                last_size = size
+                line = tail_last_line(log_path)
+                if line and line != last_line:
+                    last_line = line
+                    changed = True
+            # Redraw on a new log line or ~once a second to tick the clock.
+            if changed or now - last_draw >= 1.0:
+                last_draw = now
+                elapsed = _fmt_elapsed(now - start)
+                text = f"  [{elapsed}] {last_line}" if last_line \
+                    else f"  [{elapsed}]"
+                status.show(text)
+    finally:
+        # The task is done: drop the transient line right away rather than
+        # leaving its last line frozen until the next header prints.
+        status.clear()
+    return rc
 
 
 def stamp_path(stamp_dir: str, task: Task, kind: str) -> str:
