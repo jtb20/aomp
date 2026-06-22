@@ -15,8 +15,10 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 
 from .backend import Backend
 from .model import Config, Task
@@ -91,6 +93,26 @@ def resolve_components(
                     changed = True
 
     return topo_sort(cfg, final)
+
+
+def reverse_dep_closure(cfg: Config, seed: set[str]) -> set[str]:
+    """The seed plus every component that transitively *depends on* it.
+
+    Walks the inverse of the build-dependency graph (cfg.packages[c].depends):
+    if rocgdb depends on amd-llvm, then amd-llvm's closure includes rocgdb (and
+    anything depending on rocgdb, transitively). Used by --rdeps to rebuild a
+    subset's dependents instead of pinning them."""
+    closure = {c for c in seed if c in cfg.packages}
+    changed = True
+    while changed:
+        changed = False
+        for comp, pkg in cfg.packages.items():
+            if comp in closure:
+                continue
+            if any(dep in closure for dep in pkg.depends):
+                closure.add(comp)
+                changed = True
+    return closure
 
 
 def topo_sort(cfg: Config, comps: set[str]) -> list[str]:
@@ -393,6 +415,56 @@ def tail_file(path: str, n: int = 40) -> str:
     return "".join(lines[-n:])
 
 
+def tail_last_line(path: str, maxbytes: int = 8192) -> str:
+    """Last non-empty line of `path` (reading only the trailing `maxbytes`), or
+    "" if unreadable/empty. Used to surface live build progress without slurping
+    the whole (potentially huge) log on every poll."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            start = max(0, handle.tell() - maxbytes)
+            handle.seek(start)
+            data = handle.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", "replace")
+    for line in reversed(text.splitlines()):
+        stripped = line.rstrip()
+        if stripped.strip():
+            return stripped
+    return ""
+
+
+def run_with_progress(
+    cmd: list[str], env: dict[str, str], log, log_path: str,
+    status: "StatusLine", poll: float = 0.1,
+) -> int:
+    """Run `cmd` (stdout+stderr -> the open file `log`) while updating `status`
+    with the clipped last line of the growing log (two-space indented).
+
+    Polls at most every `poll` seconds (~10 Hz) and only redraws when the log
+    has actually grown and its last line changed, so an idle/quiet build does no
+    extra terminal I/O. Returns the process return code."""
+    proc = subprocess.Popen(
+        cmd, stdout=log, stderr=subprocess.STDOUT, env=env
+    )
+    last_line: str | None = None
+    last_size = -1
+    while proc.poll() is None:
+        try:
+            size = os.path.getsize(log_path)
+        except OSError:
+            size = last_size
+        if size != last_size:
+            last_size = size
+            line = tail_last_line(log_path)
+            if line and line != last_line:
+                last_line = line
+                status.show(f"  {line}")
+        time.sleep(poll)
+    return proc.returncode
+
+
 def stamp_path(stamp_dir: str, task: Task, kind: str) -> str:
     """Path of a task's stamp file (keyed by its stable name). kind is one of
     'start' (written when the task begins) or 'done' (written on success)."""
@@ -424,6 +496,45 @@ def render_mark(state: str) -> str:
     if state == "incomplete":
         return "\033[31m\u2717\033[0m" if tty else "\u2717"
     return " "
+
+
+class StatusLine:
+    """An ephemeral one-line build-progress indicator on a TTY.
+
+    On a non-TTY stdout (pipe, file, CI log) every method is a no-op, so output
+    stays clean. On a TTY, show() draws a transient mid-grey line at the cursor
+    (no trailing newline) and clear() erases it. Callers MUST clear() before any
+    real print so the transient line never blends into permanent output -- it is
+    meant to be wiped by the next line print, an error, or completion."""
+
+    GREY = "\033[38;5;244m"
+    RESET = "\033[0m"
+    # Carriage return + "erase entire line": resets the cursor to column 0 and
+    # clears whatever the status line drew.
+    _ERASE = "\r\033[2K"
+
+    def __init__(self, stream=None) -> None:
+        self.stream = stream if stream is not None else sys.stdout
+        self.enabled = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.active = False
+
+    def show(self, text: str) -> None:
+        if not self.enabled:
+            return
+        # Keep it to a single physical line: truncate to the terminal width so
+        # it never wraps (a wrapped line can't be cleared with one erase).
+        cols = shutil.get_terminal_size((80, 24)).columns
+        text = text[: max(0, cols - 1)]
+        self.stream.write(f"{self._ERASE}{self.GREY}{text}{self.RESET}")
+        self.stream.flush()
+        self.active = True
+
+    def clear(self) -> None:
+        if not self.enabled or not self.active:
+            return
+        self.stream.write(self._ERASE)
+        self.stream.flush()
+        self.active = False
 
 
 def clear_stamps_from(stamp_dir: str, tasks: list[Task], start_index: int) -> None:
@@ -485,6 +596,25 @@ def run_tasks(
     # the full count, so a selected subset still reports its real task numbers.
     total = len(tasks)
     width = len(str(total))
+    status = StatusLine()
+    try:
+        return _run_task_loop(
+            backend, tasks, indices, env, log_dir, dry_run,
+            build_type_global, build_type_per_comp, log_base, stamp_dir,
+            total, width, status,
+        )
+    finally:
+        status.clear()
+
+
+def _run_task_loop(
+    backend: Backend, tasks: list[Task], indices: list[int],
+    env: dict[str, str], log_dir: str, dry_run: bool,
+    build_type_global: str | None,
+    build_type_per_comp: dict[str, str],
+    log_base: str | None, stamp_dir: str | None,
+    total: int, width: int, status: "StatusLine",
+) -> int:
     for idx in indices:
         task = tasks[idx]
         num = idx + 1
@@ -512,6 +642,8 @@ def run_tasks(
             candidate = os.path.relpath(log_path, log_base)
             if not candidate.startswith(".."):
                 rel_log = candidate
+        # Wipe any leftover status line before emitting a permanent line.
+        status.clear()
         if dry_run:
             print(f"{header}\n    {' '.join(cmd)}{bt_note}  > {rel_log}")
             continue
@@ -533,12 +665,13 @@ def run_tasks(
             if task.builtin == "install_clean":
                 rc = run_install_clean(task.targets, task_env, log)
             else:
-                rc = subprocess.run(
-                    cmd, stdout=log, stderr=subprocess.STDOUT, env=task_env
-                ).returncode
+                rc = run_with_progress(
+                    cmd, task_env, log, log_path, status
+                )
             end = datetime.datetime.now()
             log.write(f"\n### end: {end.isoformat()} (rc={rc})\n")
         if rc != 0:
+            status.clear()
             print(
                 f"\n{PROG}: FAILED task {num} ({task.name}), rc={rc}",
                 file=sys.stderr,
@@ -729,6 +862,16 @@ def parse_scoped_specs(specs: list[str]) -> tuple[list[str], dict[str, list[str]
     return global_values, per_comp
 
 
+def normalize_gfx_list(value: str) -> str:
+    """Normalize a --gfx value to the space-separated GFXLIST form.
+
+    Accepts comma- and/or whitespace-separated GPU targets (so the user can
+    write `--gfx gfx90a,gfx942` without quoting) and returns them joined by
+    single spaces, the form every downstream srock / build_*.sh consumer
+    expects (e.g. `gfx90a gfx942`)."""
+    return " ".join(value.replace(",", " ").split())
+
+
 def parse_build_type_specs(specs: list[str]) -> tuple[str | None, dict[str, str]]:
     """Resolve --build-type into a single global type and per-component types.
 
@@ -758,6 +901,9 @@ def build_arg_parser(
             "Selectors (positional, amd-build style):\n"
             "  (none)        run all elaborated tasks\n"
             "  list          print the numbered task list and exit\n"
+            "  list-features print the backend's configurable features and exit\n"
+            "                  (TheRock: THEROCK_ENABLE_* features; enable one\n"
+            "                  with --add <name> --reconfigure)\n"
             "  N             run task number N (1-based)\n"
             "  N--M          run the inclusive range of tasks N..M\n"
             "  comp/variant/stage  glob/substring match (supports {a,b} braces);\n"
@@ -837,7 +983,9 @@ def build_arg_parser(
     parser.add_argument("--no-ccache", dest="ccache", action="store_false",
                         help="do not use ccache (AOMP_USE_CCACHE=0)")
     parser.add_argument("--gfx", default=None, metavar="LIST",
-                        help="GPU target list (GFXLIST)")
+                        type=normalize_gfx_list,
+                        help="GPU target list (GFXLIST); comma- or "
+                             "space-separated, e.g. 'gfx90a,gfx942'")
     parser.add_argument("--build-type", action="append", default=[],
                         metavar="SPEC",
                         help="CMake build type (BUILD_TYPE): 'type' (global) or "
@@ -902,6 +1050,15 @@ def add_backend_options(
         help="clear all prebuilt markers (buildctl.py enable) so every "
              "component is buildable again, then proceed normally.",
     )
+    group.add_argument(
+        "--rdeps", action="store_true",
+        help="when building a subset, also rebuild the components that "
+             "(transitively) depend on it instead of pinning them. By default "
+             "only the explicitly-selected components rebuild and their "
+             "dependents are left prebuilt; with --rdeps the reverse-dependency "
+             "closure is built too (e.g. rebuilding amd-llvm also rebuilds "
+             "rocgdb).",
+    )
 
 
 def make_backend(args: argparse.Namespace) -> Backend:
@@ -922,6 +1079,30 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
     config_name = backend.config_name(args)
     child_env = backend.build_child_env(args)
     env_info = backend.discover_env(child_env)
+
+    # `list-features` selector: print the backend's feature catalog and exit.
+    # Same positional syntax as `list`; a green check marks an enabled feature,
+    # a red cross a disabled one (enable a disabled feature with --add <name>
+    # --reconfigure).
+    if args.selectors and args.selectors[0] == "list-features":
+        rows = backend.list_features(child_env)
+        if rows is None:
+            print(f"{PROG}: this backend has no configurable features")
+            return 0
+        if not rows:
+            print(f"{PROG}: no features found "
+                  f"(run with --reconfigure to generate the feature catalog)")
+            return 0
+        width = max(len(r["name"]) for r in rows)
+        for r in rows:
+            mark = render_mark("done" if r["enabled"] else "incomplete")
+            line = f"[{mark}] {r['name']:<{width}}"
+            if r.get("requires"):
+                line += f"  requires: {', '.join(r['requires'])}"
+            if r.get("description"):
+                line += f"  - {r['description']}"
+            print(line)
+        return 0
 
     components = resolve_components(cfg, args.add, args.remove)
 
@@ -970,12 +1151,30 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
     tasks += backend.trailing_tasks(components, child_env)
 
     # `list` selector: print the numbered task list and exit. A green check
-    # marks completed tasks, a red cross marks started-but-unfinished ones.
+    # marks completed tasks (or ones already built in the backend), a red cross
+    # marks started-but-unfinished ones. Trailing selectors after `list` preview
+    # a focused build: components not in that set (and already built) are shown
+    # with a [pinned] suffix, since a real run would mark them prebuilt.
     if args.selectors and args.selectors[0] == "list":
+        preview = args.selectors[1:]
+        explicit = {tasks[i].comp for i in select_tasks(tasks, preview)}
+        if args.rdeps:
+            explicit |= reverse_dep_closure(cfg, explicit)
+        built = backend.built_components(child_env)
+        # Only a strict, non-empty preview pins anything (a full/empty preview
+        # builds everything, pinning nothing). Pinned subset is the already-built
+        # complement of the focused set.
+        all_comps = {t.comp for t in tasks}
+        focused = bool(preview) and explicit and explicit != all_comps
+        pinned: set[str] = (built - explicit) if (built and focused) else set()
         width = len(str(len(tasks)))
         for i, task in enumerate(tasks, start=1):
-            mark = render_mark(task_state(stamp_dir, task))
-            print(f"[{i:0{width}d}] [{mark}] {task.name}")
+            state = task_state(stamp_dir, task)
+            if state != "done" and built and task.comp in built:
+                state = "done"
+            mark = render_mark(state)
+            suffix = "  [pinned]" if task.comp in pinned else ""
+            print(f"[{i:0{width}d}] [{mark}] {task.name}{suffix}")
         return 0
 
     # Bare `continue`: resume from the first task that is not yet done.
@@ -1009,6 +1208,20 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
     if not indices:
         print(f"{PROG}: no tasks selected")
         return 0
+
+    # --rdeps: when building a strict subset, also run the tasks of every
+    # component that (transitively) depends on the selected set, so dependents
+    # are rebuilt rather than left pinned. The reverse-dependency closure pulls
+    # those components' tasks into the run (kept in dependency order).
+    if args.rdeps:
+        selected_comps = {tasks[i].comp for i in indices}
+        all_comps = {t.comp for t in tasks}
+        if selected_comps and selected_comps != all_comps:
+            expanded = reverse_dep_closure(cfg, selected_comps)
+            if expanded != selected_comps:
+                idx_set = set(indices)
+                idx_set |= {i for i, t in enumerate(tasks) if t.comp in expanded}
+                indices = sorted(idx_set)
 
     # Let the backend adjust build state for exactly the components about to
     # run (e.g. TheRock marks out-of-scope components prebuilt so a focused
