@@ -7,7 +7,7 @@ grammar, the logging/stamp execution loop, and the manifest workflow).
 
 The two implementations are:
   * AompBackend     - per-component ``build_<name>.sh`` scripts (a CUDF config).
-  * TheRockBackend  - a CMake super-build introspected to ``subprojects_map.json``.
+  * TheRockBackend  - a CMake super-build introspected to ``subproject_map.json``.
 """
 
 from __future__ import annotations
@@ -53,6 +53,18 @@ class Backend(ABC):
         """The ordered raw tasks for a component: (action, cfgname, payload).
         Config-less init/fini tasks use cfgname=None."""
 
+    def trailing_tasks(
+        self, components: list[str], env: dict[str, str]
+    ) -> list[Task]:
+        """Whole-build pseudo-tasks appended after all per-component tasks.
+
+        These are not tied to a single component (so they are not produced by
+        list_component_tasks): e.g. TheRock's whole-tree "assemble the combined
+        dist tree" and "install to the final dir" steps, which are deliberately
+        not per-subproject. Returned tasks are fully formed and run via
+        task_command like any other. The default is no trailing tasks."""
+        return []
+
     # --- execution -------------------------------------------------------- #
     @abstractmethod
     def task_command(
@@ -76,4 +88,32 @@ class Backend(ABC):
 
     def install_clean_task(self, env_info: dict[str, str]) -> Task | None:
         """The -C/--clean pseudo-task (wipe install dir), or None if unsupported."""
+        return None
+
+    def prepare_run(
+        self, selected_comps: set[str], env: dict[str, str],
+        args: argparse.Namespace,
+    ) -> None:
+        """Hook invoked once after task selection, before any task runs.
+
+        `selected_comps` is the set of component names appearing in the tasks
+        about to run. A backend may use this to adjust build state for the
+        upcoming run -- e.g. the TheRock backend marks out-of-scope components
+        as prebuilt (so a focused/incremental subset build, and any later
+        whole-tree install, does not rebuild dependents the user is not working
+        on). Honors args.dry_run. The default does nothing."""
+        return None
+
+    # --- sharding (optional) --------------------------------------------- #
+    def shard_run_lengths(
+        self, tasks: list[Task], env: dict[str, str]
+    ) -> list[int] | None:
+        """Preferred contiguous run boundaries for --shard, or None.
+
+        The default (None) makes --shard split the dependency-ordered task list
+        into N balanced segments by task count. A backend may instead return the
+        lengths of contiguous runs (summing to len(tasks)) that the shard cut
+        points should snap to -- e.g. TheRock groups tasks by build *stage* so a
+        shard boundary never splits a stage. Returning a grouping never reorders
+        tasks; it only biases where the N cuts fall."""
         return None

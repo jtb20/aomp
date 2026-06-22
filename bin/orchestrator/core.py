@@ -30,6 +30,10 @@ def _fail(msg: str) -> "None":
     sys.exit(f"{PROG}: {msg}")
 
 
+def _warn(msg: str) -> None:
+    print(f"{PROG}: warning: {msg}", file=sys.stderr)
+
+
 # --------------------------------------------------------------------------- #
 # Feature expansion + dependency resolution
 # --------------------------------------------------------------------------- #
@@ -318,6 +322,52 @@ def partition_shard(num_tasks: int, k: int, n: int) -> list[int]:
         bounds.append((start, start + size))
         start += size
     lo, hi = bounds[k - 1]
+    return list(range(lo, hi))
+
+
+def partition_shard_aligned(
+    num_tasks: int, run_lengths: list[int], k: int, n: int
+) -> list[int]:
+    """Like partition_shard, but snap the N cut points to run boundaries.
+
+    `run_lengths` are the lengths of contiguous runs (summing to num_tasks) that
+    a shard boundary should not split -- for TheRock these are build stages. We
+    compute the ideal balanced cut positions (i*num_tasks/n) and move each to the
+    nearest cumulative run boundary, keeping cuts strictly increasing so every
+    shard is a contiguous, non-empty-where-possible segment in dependency order.
+    Falls back to the plain count-based partition when the runs are unusable.
+    """
+    if n <= 0:
+        _fail("--shard N must be >= 1")
+    if not (1 <= k <= n):
+        _fail(f"--shard k must be in 1..{n} (got {k})")
+    if sum(run_lengths) != num_tasks or any(r <= 0 for r in run_lengths):
+        return partition_shard(num_tasks, k, n)
+
+    # Cumulative run boundaries (candidate cut positions), excluding 0/num_tasks.
+    boundaries = []
+    acc = 0
+    for length in run_lengths[:-1]:
+        acc += length
+        boundaries.append(acc)
+
+    cuts = [0]
+    used: set[int] = set()
+    for i in range(1, n):
+        ideal = round(i * num_tasks / n)
+        # Snap to the nearest unused boundary; if all are taken, keep splitting
+        # at the ideal position so we still produce n segments.
+        candidate = min(
+            (b for b in boundaries if b not in used),
+            key=lambda b: (abs(b - ideal), b),
+            default=ideal,
+        )
+        if candidate <= cuts[-1]:
+            candidate = min(cuts[-1] + 1, num_tasks)
+        used.add(candidate)
+        cuts.append(candidate)
+    cuts.append(num_tasks)
+    lo, hi = cuts[k - 1], cuts[k]
     return list(range(lo, hi))
 
 
@@ -814,6 +864,56 @@ def build_arg_parser(
     return parser
 
 
+def add_backend_options(
+    parser: argparse.ArgumentParser, default_backend: str = "aomp"
+) -> None:
+    """Add the backend selector and TheRock-specific knobs to a parser.
+
+    Kept separate from build_arg_parser so the generic flags stay backend-
+    agnostic. The TheRock options are no-ops for the AOMP backend.
+    """
+    parser.add_argument(
+        "--backend", choices=["aomp", "therock"], default=default_backend,
+        help=f"build backend to drive (default: {default_backend}). 'aomp' runs "
+             "the per-component build_<name>.sh scripts; 'therock' drives "
+             "TheRock's CMake super-build via subproject_map.json introspection.",
+    )
+    group = parser.add_argument_group("TheRock backend (--backend therock)")
+    group.add_argument(
+        "--reconfigure", action="store_true",
+        help="force a fresh TheRock cmake configure (with "
+             "-DTHEROCK_INTROSPECTION=ON) to regenerate subproject_map.json, "
+             "even if a cached one exists.",
+    )
+    group.add_argument(
+        "--therock-dir", default=None, metavar="DIR",
+        help="path to the TheRock checkout (overrides SROCK_THEROCK_DIR).",
+    )
+    group.add_argument(
+        "--no-auto-pin", action="store_true",
+        help="do not auto-mark out-of-scope components as prebuilt when "
+             "building a subset. By default a focused subset build marks every "
+             "other (already-built) component prebuilt via buildctl.py so the "
+             "build -- and any later whole-tree install -- does not rebuild "
+             "dependents you are not working on.",
+    )
+    group.add_argument(
+        "--unpin-all", action="store_true",
+        help="clear all prebuilt markers (buildctl.py enable) so every "
+             "component is buildable again, then proceed normally.",
+    )
+
+
+def make_backend(args: argparse.Namespace) -> Backend:
+    """Instantiate the backend selected by --backend (defaults to aomp)."""
+    backend = getattr(args, "backend", "aomp")
+    if backend == "therock":
+        from .therock_backend import TheRockBackend
+        return TheRockBackend()
+    from .aomp_backend import AompBackend
+    return AompBackend()
+
+
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
@@ -864,6 +964,11 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
             _fail("this backend does not support -C/--clean")
         tasks.insert(0, clean_task)
 
+    # Whole-build pseudo-tasks (e.g. TheRock's combined dist + final install)
+    # are appended after every per-component task so they run last on a full
+    # build and can be selected by name (e.g. 'therock/install').
+    tasks += backend.trailing_tasks(components, child_env)
+
     # `list` selector: print the numbered task list and exit. A green check
     # marks completed tasks, a red cross marks started-but-unfinished ones.
     if args.selectors and args.selectors[0] == "list":
@@ -888,15 +993,27 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
         indices = select_tasks(tasks, args.selectors)
 
     # --shard k/N narrows the selection to the k-th dependency-ordered segment.
+    # A backend may supply contiguous run boundaries (e.g. TheRock build stages)
+    # for the cut points to snap to; otherwise the segments are balanced purely
+    # by task count.
     shard = parse_shard(args.shard)
     if shard is not None:
         k, n = shard
-        shard_idx = set(partition_shard(len(tasks), k, n))
+        runs = backend.shard_run_lengths(tasks, child_env)
+        if runs:
+            shard_idx = set(partition_shard_aligned(len(tasks), runs, k, n))
+        else:
+            shard_idx = set(partition_shard(len(tasks), k, n))
         indices = [i for i in indices if i in shard_idx]
 
     if not indices:
         print(f"{PROG}: no tasks selected")
         return 0
+
+    # Let the backend adjust build state for exactly the components about to
+    # run (e.g. TheRock marks out-of-scope components prebuilt so a focused
+    # subset build does not cascade rebuilds into dependents).
+    backend.prepare_run({tasks[i].comp for i in indices}, child_env, args)
 
     return run_tasks(
         backend, tasks, indices, child_env, log_dir, args.dry_run,
