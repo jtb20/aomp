@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 
-from . import core
+from . import core, source_layout
 from .backend import Backend
 from .model import Config, Package, RawTask, Task
 
@@ -298,6 +298,67 @@ class AompBackend(Backend):
 
     def floating_components(self) -> set[str]:
         return set(FLOATING_COMPONENTS)
+
+    # --- source provisioning --------------------------------------------- #
+    def _needs_rocmlibs(self, components: list[str]) -> bool:
+        """True if any selected component is backed by the rocmlibs checkout
+        (x-dir: rocmlibs in the config)."""
+        assert self._cfg is not None
+        for comp in components:
+            pkg = self._cfg.packages.get(comp)
+            if pkg is not None and pkg.xdir == "rocmlibs":
+                return True
+        return False
+
+    def _run_clone_script(
+        self, rel_script: str, env: dict[str, str], dry_run: bool
+    ) -> int:
+        script = os.path.join(BIN_DIR, rel_script)
+        if not os.path.exists(script):
+            core._warn(f"clone script not found: {script}")
+            return 0
+        print(f"--- {os.path.basename(script)} ---")
+        if dry_run:
+            print(f"  (dry-run) would run: bash {script}")
+            return 0
+        return subprocess.run(["bash", script], env=env).returncode
+
+    def provision_sources(
+        self, args: argparse.Namespace, env: dict[str, str],
+        components: list[str],
+    ) -> int:
+        symlinks = getattr(args, "therock_symlinks", None)
+        clone = getattr(args, "clone", False)
+        if not symlinks and not clone:
+            return 0
+
+        repos = self.discover_env(env)["AOMP_REPOS"]
+        dry = getattr(args, "dry_run", False)
+
+        if symlinks:
+            therock_dir = os.path.abspath(os.path.expanduser(symlinks))
+            print(f"--- symlinking shared sources from {therock_dir} "
+                  f"into {repos} ---")
+            plan = source_layout.symlink_plan(repos, therock_dir)
+            for act in plan:
+                if act.status in ("skip-existing", "missing-target"):
+                    core._warn(f"{act.comp.aomp_dir}: {act.note}")
+                elif act.status == "already-linked":
+                    print(f"  {act.comp.aomp_dir}: already linked")
+            source_layout.apply_symlinks(plan, dry_run=dry)
+
+        # Both --clone and --therock-symlinks fill in the remaining AOMP-only
+        # repos via clone_aomp.sh (which skips any symlinked dirs).
+        rc = self._run_clone_script("clone_aomp.sh", env, dry)
+        if rc != 0:
+            return rc
+        if self._needs_rocmlibs(components):
+            rc = self._run_clone_script(
+                os.path.join("rocmlibs", "clone_rocmlibs.sh"), env, dry
+            )
+            if rc != 0:
+                return rc
+        return 0
 
     def install_clean_task(self, env_info: dict[str, str]) -> Task:
         """The -C/--clean pseudo-task: wipe the install directory (the versioned

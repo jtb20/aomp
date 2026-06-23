@@ -1111,6 +1111,35 @@ def add_backend_options(
              "rocgdb).",
     )
 
+    prov = parser.add_argument_group(
+        "source provisioning (run once, before building)"
+    )
+    prov.add_argument(
+        "--clone", action="store_true",
+        help="[aomp] clone the AOMP sources into -s/--source via clone_aomp.sh "
+             "(and rocmlibs/clone_rocmlibs.sh when the selected set includes "
+             "rocmlibs components), then build as usual.",
+    )
+    prov.add_argument(
+        "--therock-symlinks", default=None, metavar="DIR",
+        help="[aomp] provision -s/--source by symlinking the shared standalone "
+             "repos (llvm-project, rocm-cmake, hipify, ROCgdb, half, "
+             "SPIRV-LLVM-Translator) from the TheRock checkout DIR, then "
+             "clone the remaining AOMP-only repos via clone_aomp.sh.",
+    )
+    prov.add_argument(
+        "--migrate-aomp", default=None, metavar="REPODIR",
+        help="[therock] MOVE the shared standalone repos out of the AOMP "
+             "checkout REPODIR into -s/--source's TheRock submodule slots, "
+             "converting each standalone repo into a submodule gitdir. "
+             "Destructive (moves directories); prompts unless -y/--yes.",
+    )
+    prov.add_argument(
+        "-y", "--yes", action="store_true",
+        help="skip the confirmation prompt for destructive provisioning "
+             "(--migrate-aomp).",
+    )
+
 
 def make_backend(args: argparse.Namespace) -> Backend:
     """Instantiate the backend selected by --backend (defaults to aomp)."""
@@ -1156,6 +1185,12 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
         return 0
 
     components = resolve_components(cfg, args.add, args.remove)
+
+    # Source provisioning (--clone / --therock-symlinks / --migrate-aomp) runs
+    # once here, after the component set is known and before any task work.
+    prov_rc = backend.provision_sources(args, child_env, components)
+    if prov_rc != 0:
+        return prov_rc
 
     if args.components:
         for comp in components:

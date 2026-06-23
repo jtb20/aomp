@@ -35,6 +35,15 @@ echo "$(git config --get remote.origin.url)" " desired: " "$COBRANCH" " actual: 
 }
 
 function clone_or_pull(){
+# Shared-source provisioning (orchestrator --therock-symlinks) replaces a
+# component's repo dir with a symlink into a canonical TheRock checkout. Never
+# clone/pull/checkout through such a symlink: that would mutate the canonical
+# tree. Leave it untouched.
+if [ -L "$AOMP_REPOS/$reponame" ] ; then
+   echo
+   echo "--- Skipping $reponame: $AOMP_REPOS/$reponame is a symlink to a shared (TheRock) source ---"
+   return
+fi
 if [ "$LISTONLY" == 'list' ]; then
 list_repo
 return
