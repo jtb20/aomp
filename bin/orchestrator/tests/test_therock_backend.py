@@ -130,6 +130,28 @@ class TheRockFixtureTest(unittest.TestCase):
         self.assertTrue(all("/dist" not in n and "expunge" not in n for n in names))
         self.assertTrue(all(t.cfgname is None for t in tasks))
 
+    def test_all_flag_exposes_every_action(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "-a", "list")
+        cfg = backend.load_config(args)
+        env = backend.build_child_env(args)
+        components = core.resolve_components(cfg, args.add, args.remove)
+        tasks = core.elaborate_tasks(backend, cfg, components, env, [], {})
+        names = [t.name for t in tasks]
+        # With --all every advertised action appears, in lifecycle order
+        # (expunge -> configure -> build -> stage -> dist) per component.
+        self.assertEqual(
+            names[:5],
+            [
+                "rocm-cmake/expunge", "rocm-cmake/configure",
+                "rocm-cmake/build", "rocm-cmake/stage", "rocm-cmake/dist",
+            ],
+        )
+        # 5 actions x 3 components.
+        self.assertEqual(len(names), 15)
+        self.assertTrue(any(n.endswith("/dist") for n in names))
+        self.assertTrue(any(n.endswith("/expunge") for n in names))
+
     def test_task_command_is_ninja_target(self) -> None:
         backend, args, cfg = self._load()
         env = backend.build_child_env(args)

@@ -91,6 +91,14 @@ DEFAULT_CONFIG = "minimal"
 # closure -- so running them respects real ordering without doing unasked work.
 FORWARD_ACTIONS = ("configure", "build", "stage")
 
+# Full per-component action menu (lifecycle order) exposed by -a/--all. Beyond
+# the default FORWARD_ACTIONS this adds the destructive clean ("expunge", first
+# so a full per-component run reads as clean->configure->build->stage->dist) and
+# the per-component "dist" (which triggers whole-tree distribution assembly, as
+# noted above). Handy for listing the full capability set and for targeted
+# selection while untangling a build; not meant for routine full builds.
+ALL_ACTIONS = ("expunge", "configure", "build", "stage", "dist")
+
 # Whole-tree pseudo-tasks appended after every per-subproject task (see
 # trailing_tasks). These are the install-all counterparts to amd-build's final
 # install: "dist" assembles the combined distribution tree under <build>/dist
@@ -806,8 +814,12 @@ class TheRockBackend(Backend):
         available = set(meta.get("actions", []))
         build_dir = self._env_info["BUILD_DIR"] if self._env_info else \
             self.discover_env(env)["BUILD_DIR"]
+        # -a/--all exposes every advertised action (expunge/.../dist); the
+        # default pipeline is just configure/build/stage.
+        want_all = self._args is not None and getattr(self._args, "all", False)
+        actions = ALL_ACTIONS if want_all else FORWARD_ACTIONS
         raw: list[RawTask] = []
-        for action in FORWARD_ACTIONS:
+        for action in actions:
             if action in available:
                 raw.append(
                     (action, None, {"target": f"{comp}+{action}", "bin": build_dir})
