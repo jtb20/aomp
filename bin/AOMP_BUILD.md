@@ -118,6 +118,7 @@ aomp_build.py [options] [selector ...]
 |--------|-------------|
 | `list` (selector) | Print the numbered task list and exit (`[NNN] [✓] component/stage`; the tick marks completed tasks, see [Completion stamps](#completion-stamps)). Trailing selectors preview a focused build: `list amd-llvm` marks every other already-built component `[pinned]` (TheRock only, see [Incremental focus](#incremental-focus-auto-pin-out-of-scope-components)). |
 | `list-features` (selector) | Print the backend's configurable features and exit (TheRock only: the `THEROCK_ENABLE_*` flags, with ✓/✗ enabled state). Enable one with `--add <name> --reconfigure`. |
+| `-a`, `--all` | (TheRock only) Elaborate *every* advertised per-subproject action (`expunge/configure/build/stage/dist`) instead of the default `configure/build/stage`. Use with `list` to see the full capability set, or with a selector to run a normally-hidden action (e.g. `-a amd-llvm/expunge`). See [TheRock backend](#therock-backend). |
 | `--components` | Print the resolved, dependency-ordered component list and exit. |
 | `-n`, `--dry-run` | Show what would run (command + log path per task) without executing. |
 | `--export-manifest [FILE]` | Write a git fingerprint manifest and exit. Default path: `<BUILD_DIR>/manifests/<config>-manifest.json`. |
@@ -576,6 +577,16 @@ ninja action targets. The backend reads this file as its component graph:
     and the final install are produced by the **whole-tree pseudo-tasks** below.
   - `expunge` — destructive clean; would wipe a subproject mid-build. Clean an
     install with `-C`/`--clean`, or run `ninja <subproject>+expunge` by hand.
+
+  **`-a`/`--all`** overrides this exclusion and elaborates *every* advertised
+  per-subproject action in lifecycle order
+  (`expunge → configure → build → stage → dist`). This is meant for `list`
+  (to see the full capability set) and for targeted selection while untangling a
+  build — e.g. `therock_build.py -a amd-llvm/expunge` to wipe just that
+  subproject, or `-a amd-llvm/dist`. The `dist`/`expunge` caveats above still
+  apply (per-subproject `dist` triggers whole-tree assembly; `expunge` is
+  destructive), so a *bare* `--all` run with no selectors would clean and dist
+  every component — prefer it with `list` or an explicit selector.
 
 TheRock subprojects are config-less (a single configuration is baked in at
 configure time), so tasks use the short `subproject/stage` names and the

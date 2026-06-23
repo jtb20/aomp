@@ -1092,6 +1092,16 @@ def add_backend_options(
              "component is buildable again, then proceed normally.",
     )
     group.add_argument(
+        "-a", "--all", action="store_true",
+        help="elaborate every advertised per-component action "
+             "(expunge/configure/build/stage/dist) instead of just the default "
+             "configure/build/stage. Intended for `list` and for targeted "
+             "selection while untangling a build (e.g. 'amd-llvm/expunge'); note "
+             "that per-component 'dist' triggers whole-tree distribution "
+             "assembly and 'expunge' is a destructive clean, so a bare --all "
+             "run would clean/dist every component.",
+    )
+    group.add_argument(
         "--rdeps", action="store_true",
         help="when building a subset, also rebuild the components that "
              "(transitively) depend on it instead of pinning them. By default "
