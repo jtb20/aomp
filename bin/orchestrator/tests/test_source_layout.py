@@ -159,6 +159,21 @@ class MigratePlanTests(unittest.TestCase):
             "true",
         )
 
+    def test_apply_into_empty_placeholder_slot(self):
+        # TheRock checkouts have the submodule path as an empty placeholder dir
+        # (unfetched submodule). The repo must land *at* dest, not nested inside.
+        src = os.path.join(self.aomp, LLVM.aomp_dir)
+        _init_repo(src)
+        dest = os.path.join(self.therock, LLVM.therock_path)
+        os.makedirs(dest)  # empty placeholder
+        plan = source_layout.migrate_plan(self.therock, self.aomp)
+        self.assertEqual(next(a for a in plan if a.comp is LLVM).status, "ready")
+        source_layout.apply_migration(self.therock, plan)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "README")))
+        self.assertTrue(os.path.isfile(os.path.join(dest, ".git")))
+        self.assertFalse(os.path.exists(os.path.join(dest, "llvm-project")),
+                         "repo must not be nested inside the placeholder")
+
     def test_dry_run_moves_nothing(self):
         src = os.path.join(self.aomp, LLVM.aomp_dir)
         _init_repo(src)

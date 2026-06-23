@@ -204,8 +204,23 @@ def apply_migration(
         log(f"  move {act.comp.aomp_dir} -> {act.comp.therock_path}")
         if dry_run:
             continue
+        # A standalone clone keeps its objects in a .git *directory*. If .git is
+        # a file (already a linked worktree/submodule), moving the working tree
+        # alone would not bring the objects -- skip rather than corrupt it.
+        src_git = os.path.join(act.src_repo, ".git")
+        if not os.path.isdir(src_git):
+            log(f"    skip: {act.src_repo}/.git is not a directory "
+                f"(not a standalone clone)")
+            continue
         # 1. Move the whole working tree (incl. its .git directory) into place.
+        #    The TheRock checkout usually already has the submodule path as an
+        #    empty placeholder dir (unfetched submodule); remove it first so the
+        #    move renames into place rather than nesting the repo inside it.
         os.makedirs(os.path.dirname(act.dest_path), exist_ok=True)
+        if os.path.islink(act.dest_path):
+            os.unlink(act.dest_path)
+        elif os.path.isdir(act.dest_path) and not os.listdir(act.dest_path):
+            os.rmdir(act.dest_path)
         shutil.move(act.src_repo, act.dest_path)
         # 2. Relocate the repo's .git dir into the superproject's modules store.
         module_dir = os.path.join(git_dir, "modules", act.comp.submodule_name)
