@@ -1239,6 +1239,11 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
             _fail("this backend does not support -C/--clean")
         tasks.insert(0, clean_task)
 
+    # Leading whole-build pseudo-tasks (e.g. TheRock's `therock/prereq`, which
+    # builds the cmake/ninja toolchain) run before every per-component task so a
+    # full build sets up its prerequisites first, with output captured to a log.
+    tasks = backend.leading_tasks(components, child_env) + tasks
+
     # Whole-build pseudo-tasks (e.g. TheRock's combined dist + final install)
     # are appended after every per-component task so they run last on a full
     # build and can be selected by name (e.g. 'therock/install').

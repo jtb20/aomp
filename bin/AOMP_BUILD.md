@@ -674,6 +674,16 @@ Requesting a feature that is already enabled is a no-op (no flag appended, no
 reconfigure forced), so `--add <feature>` is safe to leave in a command line
 across incremental builds.
 
+### Leading pseudo-task (prereq toolchain)
+
+A `therock/prereq` pseudo-task is prepended **before** every per-subproject task.
+It runs `srock-bin/build_cmake.sh` to build the cmake/ninja prerequisite
+toolchain, so that output is captured to a per-task log
+(`<build>/aomp_build_logs/001-therock-prereq.log`) instead of spamming the
+console mid-build. `build_cmake.sh` self-checks, so it's a cheap no-op once the
+tools are built. It appears as task 1 in `list` and can be run on its own
+(`therock_build.py therock/prereq`).
+
 ### Whole-tree pseudo-tasks (dist + install)
 
 Because `dist`/install are whole-tree operations (not per-subproject), the

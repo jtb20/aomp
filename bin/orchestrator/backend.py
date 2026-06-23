@@ -53,6 +53,19 @@ class Backend(ABC):
         """The ordered raw tasks for a component: (action, cfgname, payload).
         Config-less init/fini tasks use cfgname=None."""
 
+    def leading_tasks(
+        self, components: list[str], env: dict[str, str]
+    ) -> list[Task]:
+        """Whole-build pseudo-tasks prepended before all per-component tasks.
+
+        These run first on a full build and can be selected by name. Used for
+        one-time build prerequisites that are not a single component -- e.g.
+        TheRock's `therock/prereq`, which builds the cmake/ninja toolchain so
+        that output is captured to a task log instead of spamming the console.
+        Returned tasks are fully formed and run via task_command. The default is
+        no leading tasks."""
+        return []
+
     def trailing_tasks(
         self, components: list[str], env: dict[str, str]
     ) -> list[Task]:

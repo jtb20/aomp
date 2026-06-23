@@ -203,6 +203,15 @@ class TheRockFixtureTest(unittest.TestCase):
         install_cmd, _ = backend.task_command(trailing[1], env)
         self.assertEqual(install_cmd[3], "install")
 
+    def test_leading_task_is_prereq_running_build_cmake(self) -> None:
+        backend, args, _ = self._load()
+        env = backend.build_child_env(args)
+        leading = backend.leading_tasks(["amd-llvm"], env)
+        self.assertEqual([t.name for t in leading], ["therock/prereq"])
+        cmd, _ = backend.task_command(leading[0], env)
+        self.assertEqual(cmd[0], "bash")
+        self.assertTrue(cmd[1].endswith("build_cmake.sh"))
+
     def test_sysdeps_via_add_drives_cmake_extra(self) -> None:
         # Default: bundle OFF (host system deps). `--add sysdeps`: bundle ON.
         # The value is appended to SROCK_CMAKE_EXTRA (srock passes it last, so
