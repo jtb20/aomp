@@ -106,6 +106,15 @@ class Backend(ABC):
         component's checkbox as done. Default: None (e.g. the AOMP backend)."""
         return None
 
+    def provision_preconfig(self, args: argparse.Namespace) -> int | None:
+        """Standalone source provisioning that must run *before* load_config
+        (and therefore before any configure/source fetch). Returns None when
+        there is nothing to do (the run continues normally), or an exit code to
+        return immediately. Used by TheRock's --migrate-aomp, which seeds the
+        submodule slots from an AOMP checkout before the configure that would
+        otherwise fetch them. The default does nothing."""
+        return None
+
     def provision_sources(
         self, args: argparse.Namespace, env: dict[str, str],
         components: list[str],

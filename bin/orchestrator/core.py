@@ -1155,6 +1155,14 @@ def make_backend(args: argparse.Namespace) -> Backend:
 # Driver
 # --------------------------------------------------------------------------- #
 def run(args: argparse.Namespace, backend: Backend) -> int:
+    # Pre-config source provisioning (e.g. TheRock's --migrate-aomp) runs before
+    # load_config: for TheRock, load_config triggers the cmake configure which
+    # fetches submodule sources, so seeding the submodule slots has to happen
+    # first. A handled pre-config step returns an exit code and ends the run.
+    preconfig_rc = backend.provision_preconfig(args)
+    if preconfig_rc is not None:
+        return preconfig_rc
+
     cfg = backend.load_config(args)
     config_name = backend.config_name(args)
     child_env = backend.build_child_env(args)
