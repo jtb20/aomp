@@ -984,17 +984,21 @@ to `<therock>/.git/modules/<name>` and a gitlink `.git` file is written). This i
 `-y/--yes` is given; `-n/--dry-run` previews the plan without moving anything.
 
 `--migrate-aomp` is a **standalone setup step**: it runs *before* the cmake
-configure (the configure runs `fetch_sources.py`, which would otherwise populate
-— and so block — the submodule slots) and then exits without building. Seeding
-moves the repo objects into `<therock>/.git/modules/<name>`, so the later build
-does **not** re-clone them: a subsequent `--reconfigure` only checks out the
-pinned SHA from the already-present objects. Run it, then build normally:
+configure and then exits without building. It seeds only the shared 1:1 repos,
+so afterwards it runs TheRock's `build_tools/fetch_sources.py` to populate the
+*other* submodules (the `rocm-systems` / `rocm-libraries` monorepos, etc.) that
+the configure needs. `fetch_sources.py` sees the seeded slots as already
+initialized (their gitlink `.git` exists) and only checks them out — it does
+**not** re-clone over them — while cloning the rest. Run it, then build:
 
 ```bash
-therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp -n   # preview
-therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp      # move (prompts)
-therock_build.py -s ~/git/srock --reconfigure                  # then build
+therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp -n   # preview only
+therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp      # move + fetch rest
+therock_build.py -s ~/git/srock --reconfigure                  # then configure + build
 ```
+
+The `--reconfigure` build reuses the seeded gitdirs (a fast checkout of the
+pinned SHA, no re-clone of the migrated repos).
 
 Per-repo pre-flight skips a slot that is missing in the AOMP checkout, is not a
 git repo, or whose TheRock slot is already populated. Uncommitted changes move

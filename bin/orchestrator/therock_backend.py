@@ -915,6 +915,8 @@ class TheRockBackend(Backend):
 
         aomp_repodir = os.path.abspath(os.path.expanduser(repodir))
         env = self.build_child_env(args)
+        # discover_env mutates env["PATH"] in place to prepend the TheRock venv
+        # bin, so `env` below runs fetch_sources with the venv python.
         therock_dir = self.discover_env(env)["SROCK_THEROCK_DIR"]
         dry = getattr(args, "dry_run", False)
 
@@ -961,11 +963,35 @@ class TheRockBackend(Backend):
                 return 1
 
         source_layout.apply_migration(therock_dir, plan, dry_run=dry)
-        print("\nmigration complete. Next: build with --reconfigure, e.g.\n"
-              f"  therock_build.py --backend therock -s {args.source or '<src>'} "
-              f"--reconfigure\n"
+
+        # The migrate only seeds the shared 1:1 repos; TheRock's other submodules
+        # (rocm-systems / rocm-libraries monorepos, etc.) still need fetching for
+        # the configure to succeed. fetch_sources.py treats the seeded slots as
+        # already-initialized (their .git gitlink exists) and only checks them
+        # out -- it does not re-clone over them -- while cloning the rest.
+        fetch = os.path.join(therock_dir, "build_tools", "fetch_sources.py")
+        if os.path.isfile(fetch):
+            print("\n--- fetching remaining TheRock submodules "
+                  "(build_tools/fetch_sources.py) ---")
+            rc = subprocess.run(["python", fetch], cwd=therock_dir, env=env).returncode
+            if rc != 0:
+                core._warn(
+                    "fetch_sources.py failed; re-run it in the TheRock checkout "
+                    "before configuring"
+                )
+                return rc
+        else:
+            core._warn(
+                f"{fetch} not found; run TheRock's fetch_sources before "
+                f"--reconfigure"
+            )
+
+        src = args.source or "<src>"
+        print("\nmigration complete (shared repos seeded, other submodules "
+              "fetched). Next: configure + build with --reconfigure, e.g.\n"
+              f"  therock_build.py --backend therock -s {src} --reconfigure\n"
               "The configure reuses the seeded gitdirs (fast checkout of the "
-              "pinned SHAs, no re-clone).")
+              "pinned SHAs, no re-clone of the migrated repos).")
         return 0
 
     def prepare_run(
