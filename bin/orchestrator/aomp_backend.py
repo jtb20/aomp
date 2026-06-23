@@ -332,8 +332,30 @@ class AompBackend(Backend):
         if not symlinks and not clone:
             return 0
 
-        repos = self.discover_env(env)["AOMP_REPOS"]
+        info = self.discover_env(env)
+        repos = info["AOMP_REPOS"]
         dry = getattr(args, "dry_run", False)
+
+        # Bootstrap: clone_aomp.sh refuses to run unless it lives at
+        # $AOMP_REPOS/<repo>/bin. When provisioning a *fresh* -s/--source the
+        # build-scripts repo is not there yet, so symlink this (canonical)
+        # checkout into the destination. clone_aomp.sh's realpath self-check then
+        # resolves through the link to the canonical bin, and our skip-symlink
+        # logic leaves the link untouched (no clone over the canonical tree).
+        repo_name = info.get("AOMP_REPO_NAME") or "aomp"
+        canonical_aomp = os.path.dirname(BIN_DIR)
+        link = os.path.join(os.path.abspath(os.path.expanduser(repos)), repo_name)
+        if not os.path.lexists(link):
+            print(f"--- providing build-scripts repo: "
+                  f"{repo_name} -> {canonical_aomp} ---")
+            if not dry:
+                os.makedirs(os.path.dirname(link), exist_ok=True)
+                os.symlink(canonical_aomp, link)
+        elif os.path.realpath(link) != os.path.realpath(canonical_aomp):
+            core._warn(
+                f"{link} already exists and does not point at this checkout "
+                f"({canonical_aomp}); clone_aomp.sh runs from there instead"
+            )
 
         if symlinks:
             therock_dir = os.path.abspath(os.path.expanduser(symlinks))
