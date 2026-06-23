@@ -263,8 +263,17 @@ class TheRockBackend(Backend):
             # introspected subprojects (e.g. helper targets) so the topo sort
             # only references real packages.
             depends = [d for d in self._meta[name]["build_deps"] if d in nameset]
+            # Runtime deps don't affect ordering but do propagate rebuilds: a
+            # component that consumes amd-llvm only at link/runtime (rocgdb,
+            # comgr, hipcc, ...) must still rebuild when amd-llvm changes, so we
+            # record them for --rdeps reverse-dependency closure.
+            rdeps = [
+                d for d in self._meta[name]["runtime_deps"]
+                if d in nameset and d not in depends
+            ]
             cfg.packages[name] = Package(
-                name=name, depends=depends, xdir=".", order=order
+                name=name, depends=depends, runtime_depends=rdeps,
+                xdir=".", order=order,
             )
 
         # Convenience features for --add/--remove, grouping subprojects by their

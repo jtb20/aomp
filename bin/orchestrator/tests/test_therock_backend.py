@@ -709,6 +709,43 @@ class ReverseDepClosureTest(unittest.TestCase):
             core.reverse_dep_closure(self.cfg, {"hipBLAS"}), {"hipBLAS"}
         )
 
+    def test_runtime_dep_edges_propagate(self) -> None:
+        # rocgdb consumes amd-llvm only via runtime_deps (build_deps empty), as
+        # in the real introspection map. A compiler change must still pull
+        # rocgdb into the rebuild set, so the backend records a runtime_depends
+        # edge and reverse_dep_closure follows it.
+        amd = dict(FIXTURE["amd-llvm"], build_deps=[], runtime_deps=[])
+        m = {
+            "amd-llvm": amd,
+            "rocgdb": {
+                "src": "tools/rocgdb", "bin": "tools/rocgdb/build",
+                "install_dest": "", "build_deps": [],
+                "runtime_deps": ["amd-llvm"], "build_pool": "",
+                "compiler_toolchain": "",
+                "actions": ["configure", "build", "stage", "dist", "expunge"],
+            },
+        }
+        tmp = tempfile.mkdtemp(prefix="therock-rt-")
+        try:
+            therock = os.path.join(tmp, "TheRock")
+            build = os.path.join(therock, "build")
+            os.makedirs(build)
+            with open(os.path.join(build, "subproject_map.json"), "w") as fh:
+                json.dump(m, fh)
+            cfg = TheRockBackend().load_config(
+                make_args(therock, os.path.join(tmp, "repos"), "list")
+            )
+            self.assertEqual(cfg.packages["rocgdb"].depends, [])
+            self.assertEqual(
+                cfg.packages["rocgdb"].runtime_depends, ["amd-llvm"]
+            )
+            self.assertEqual(
+                core.reverse_dep_closure(cfg, {"amd-llvm"}),
+                {"amd-llvm", "rocgdb"},
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class RdepsRunTest(unittest.TestCase):
     """--rdeps expands a subset run to its dependents (dry-run, via core.run)."""

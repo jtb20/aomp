@@ -9,6 +9,11 @@ from dataclasses import dataclass, field
 class Package:
     name: str
     depends: list[str] = field(default_factory=list)
+    # Dependencies that do not affect build *ordering* but do mean "rebuild me
+    # if this changes" (e.g. a tool that links a library at install/runtime).
+    # Kept separate from `depends` so topological ordering stays minimal (and
+    # acyclic), while reverse-dependency closure (--rdeps) can consider both.
+    runtime_depends: list[str] = field(default_factory=list)
     xdir: str = "."
     order: int = 0  # declaration order, used as topo-sort tie-break
 
