@@ -528,6 +528,21 @@ def task_state(stamp_dir: str | None, task: Task) -> str:
     return "none"
 
 
+def task_is_done(
+    stamp_dir: str | None, task: Task, built: set[str] | None
+) -> bool:
+    """Whether a task counts as complete for `list`/`continue`.
+
+    A task is done if its orchestrator 'done' stamp is present *or* the backend
+    considers its component already built (a valid stage dir, via
+    built_components). Both sources are honored so the `list` tick-box and bare
+    `continue` agree -- e.g. a component staged outside the orchestrator shows as
+    done and is skipped by `continue`."""
+    if task_state(stamp_dir, task) == "done":
+        return True
+    return bool(built) and task.comp in built
+
+
 def render_mark(state: str) -> str:
     """A mark for a task state: green check (done), red cross (incomplete),
     or a blank of the same width (none)."""
@@ -1268,19 +1283,22 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
         pinned: set[str] = (built - explicit) if (built and focused) else set()
         width = len(str(len(tasks)))
         for i, task in enumerate(tasks, start=1):
-            state = task_state(stamp_dir, task)
-            if state != "done" and built and task.comp in built:
-                state = "done"
+            state = "done" if task_is_done(stamp_dir, task, built) \
+                else task_state(stamp_dir, task)
             mark = render_mark(state)
             suffix = "  [pinned]" if task.comp in pinned else ""
             print(f"[{i:0{width}d}] [{mark}] {task.name}{suffix}")
         return 0
 
-    # Bare `continue`: resume from the first task that is not yet done.
+    # Bare `continue`: resume from the first task that is not yet done. "Done"
+    # honors both the orchestrator stamp and the backend's already-built set
+    # (the stage dir), matching the `list` tick-box -- so a component staged
+    # outside the orchestrator is skipped rather than rebuilt.
     if args.selectors == ["continue"]:
+        built = backend.built_components(child_env)
         resume = next(
             (i for i, t in enumerate(tasks)
-             if task_state(stamp_dir, t) != "done"),
+             if not task_is_done(stamp_dir, t, built)),
             None,
         )
         if resume is None:
