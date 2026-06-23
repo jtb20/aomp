@@ -983,16 +983,24 @@ to `<therock>/.git/modules/<name>` and a gitlink `.git` file is written). This i
 **destructive** (directories are moved) and prompts for confirmation unless
 `-y/--yes` is given; `-n/--dry-run` previews the plan without moving anything.
 
+`--migrate-aomp` is a **standalone setup step**: it runs *before* the cmake
+configure (the configure runs `fetch_sources.py`, which would otherwise populate
+— and so block — the submodule slots) and then exits without building. Seeding
+moves the repo objects into `<therock>/.git/modules/<name>`, so the later build
+does **not** re-clone them: a subsequent `--reconfigure` only checks out the
+pinned SHA from the already-present objects. Run it, then build normally:
+
 ```bash
 therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp -n   # preview
 therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp      # move (prompts)
+therock_build.py -s ~/git/srock --reconfigure                  # then build
 ```
 
 Per-repo pre-flight skips a slot that is missing in the AOMP checkout, is not a
 git repo, or whose TheRock slot is already populated. Uncommitted changes move
 with the tree, and a branch that differs from TheRock's expected branch is
-warned but allowed — the recorded submodule SHA is reconciled by TheRock's next
-`fetch_sources.py` / configure.
+warned but allowed — the recorded submodule SHA is reconciled by that next
+`--reconfigure` (fast local checkout, no re-clone).
 
 ---
 

@@ -897,19 +897,24 @@ class TheRockBackend(Backend):
         head = bin_rel.rsplit("/", 1)[0] if "/" in bin_rel else ""
         return (head + "/stage") if head else "stage"
 
-    def provision_sources(
-        self, args: argparse.Namespace, env: dict[str, str],
-        components: list[str],
-    ) -> int:
+    def provision_preconfig(self, args: argparse.Namespace) -> int | None:
         """--migrate-aomp REPODIR: MOVE the shared standalone repos out of the
         AOMP checkout REPODIR into this TheRock checkout's submodule slots
         (-s/--source resolves to SROCK_THEROCK_DIR), converting each into a
-        submodule gitdir. Destructive; gated by a confirmation prompt."""
+        submodule gitdir. Destructive; gated by a confirmation prompt.
+
+        Runs *before* load_config -- and hence before the cmake configure /
+        fetch_sources that would otherwise populate (and so block) the submodule
+        slots -- and then ends the run. The seeded gitdirs already hold the AOMP
+        objects, so a subsequent `--reconfigure` build reuses them (only a fast
+        checkout to the pinned SHA, no fresh clone). Returns None when
+        --migrate-aomp is not requested so a normal run proceeds."""
         repodir = getattr(args, "migrate_aomp", None)
         if not repodir:
-            return 0
+            return None
 
         aomp_repodir = os.path.abspath(os.path.expanduser(repodir))
+        env = self.build_child_env(args)
         therock_dir = self.discover_env(env)["SROCK_THEROCK_DIR"]
         dry = getattr(args, "dry_run", False)
 
@@ -956,8 +961,11 @@ class TheRockBackend(Backend):
                 return 1
 
         source_layout.apply_migration(therock_dir, plan, dry_run=dry)
-        print("migration complete; run TheRock's fetch_sources.py / a configure "
-              "to reconcile recorded submodule SHAs.")
+        print("\nmigration complete. Next: build with --reconfigure, e.g.\n"
+              f"  therock_build.py --backend therock -s {args.source or '<src>'} "
+              f"--reconfigure\n"
+              "The configure reuses the seeded gitdirs (fast checkout of the "
+              "pinned SHAs, no re-clone).")
         return 0
 
     def prepare_run(
