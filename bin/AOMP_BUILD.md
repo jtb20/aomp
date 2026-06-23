@@ -701,9 +701,14 @@ anything not yet built stays buildable and is produced if a dependency needs it.
   or a selection of only the whole-tree pseudo-tasks, pins nothing).
 - `--rdeps` rebuilds the **reverse-dependency closure** of the subset instead of
   pinning it: with `amd-llvm --rdeps`, every component that (transitively)
-  depends on `amd-llvm` (e.g. `rocgdb`) is pulled into the build and rebuilt,
-  and only the remaining built components are pinned. Forward dependencies the
-  subset *needs* (e.g. `rocm-cmake`) are still left prebuilt either way.
+  depends on `amd-llvm` is pulled into the build and rebuilt, and only the
+  remaining built components are pinned. The closure follows **both** build
+  dependencies (`build_deps`, e.g. `ROCR-Runtime`) **and** runtime/link
+  dependencies (`runtime_deps`, e.g. `rocgdb`, `amd-comgr`, `hipcc`, which link
+  the compiler's libraries but list no build-dep on it) -- so changing the
+  compiler propagates a rebuild to everything built against it. Forward
+  dependencies the subset *needs* (e.g. `rocm-cmake`) are still left prebuilt
+  either way.
 - `--unpin-all` clears all markers (`buildctl.py enable` with no args) so every
   component builds again, then proceeds normally.
 - `--no-auto-pin` leaves markers untouched for one run.

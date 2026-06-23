@@ -98,10 +98,12 @@ def resolve_components(
 def reverse_dep_closure(cfg: Config, seed: set[str]) -> set[str]:
     """The seed plus every component that transitively *depends on* it.
 
-    Walks the inverse of the build-dependency graph (cfg.packages[c].depends):
-    if rocgdb depends on amd-llvm, then amd-llvm's closure includes rocgdb (and
-    anything depending on rocgdb, transitively). Used by --rdeps to rebuild a
-    subset's dependents instead of pinning them."""
+    Walks the inverse of the dependency graph using both build edges
+    (`depends`) and runtime/link edges (`runtime_depends`): if rocgdb depends on
+    amd-llvm (even only at link/runtime), then amd-llvm's closure includes
+    rocgdb (and anything depending on rocgdb, transitively). Used by --rdeps to
+    rebuild a subset's dependents instead of pinning them -- so changing the
+    compiler propagates a rebuild to everything built against it."""
     closure = {c for c in seed if c in cfg.packages}
     changed = True
     while changed:
@@ -109,7 +111,8 @@ def reverse_dep_closure(cfg: Config, seed: set[str]) -> set[str]:
         for comp, pkg in cfg.packages.items():
             if comp in closure:
                 continue
-            if any(dep in closure for dep in pkg.depends):
+            if any(dep in closure
+                   for dep in (*pkg.depends, *pkg.runtime_depends)):
                 closure.add(comp)
                 changed = True
     return closure
