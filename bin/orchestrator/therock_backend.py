@@ -37,6 +37,9 @@ REPO_ROOT = os.path.dirname(BIN_DIR)
 SROCK_BIN_DIR = os.path.join(REPO_ROOT, "srock-bin")
 SROCK_COMMON_VARS = os.path.join(SROCK_BIN_DIR, "srock_common_vars")
 SETUP_SROCK = os.path.join(SROCK_BIN_DIR, "setup_srock.sh")
+# Builds the cmake/ninja prerequisite toolchain (it self-checks and is a no-op
+# when already built). Run as the leading `therock/prereq` task.
+BUILD_CMAKE = os.path.join(SROCK_BIN_DIR, "build_cmake.sh")
 
 # PR #1234's introspection cmake, bundled here so a stock TheRock checkout
 # (which does not carry it) can still be introspected: the bootstrap copies it
@@ -826,6 +829,22 @@ class TheRockBackend(Backend):
                 )
         return raw
 
+    def leading_tasks(
+        self, components: list[str], env: dict[str, str]
+    ) -> list[Task]:
+        """The `therock/prereq` pseudo-task: build the cmake/ninja prerequisite
+        toolchain via srock-bin/build_cmake.sh, run first so its output lands in
+        a per-task log rather than spamming the console. build_cmake.sh
+        self-checks and is a cheap no-op when the tools are already built."""
+        if not os.path.isfile(BUILD_CMAKE):
+            return []
+        return [
+            Task(
+                comp="therock", action="prereq", cfgname=None,
+                single_config=True, payload={"argv": ["bash", BUILD_CMAKE]},
+            )
+        ]
+
     def trailing_tasks(
         self, components: list[str], env: dict[str, str]
     ) -> list[Task]:
@@ -849,6 +868,11 @@ class TheRockBackend(Backend):
     def task_command(
         self, task: Task, env: dict[str, str]
     ) -> tuple[list[str], dict[str, str]]:
+        # Pseudo-tasks may carry a literal command (e.g. the prereq toolchain
+        # build) instead of a ninja target.
+        argv = task.payload.get("argv")
+        if argv is not None:
+            return list(argv), {}
         bin_dir = task.payload["bin"]
         target = task.payload["target"]
         cmd = ["ninja", "-C", bin_dir, target]
