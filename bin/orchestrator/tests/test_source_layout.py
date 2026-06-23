@@ -174,6 +174,21 @@ class MigratePlanTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(dest, "llvm-project")),
                          "repo must not be nested inside the placeholder")
 
+    def test_apply_populates_empty_working_tree(self):
+        # A migrated repo whose working tree was never checked out (HEAD has
+        # files, index+worktree empty) must be populated from HEAD so the build
+        # finds its sources.
+        src = os.path.join(self.aomp, LLVM.aomp_dir)
+        _init_repo(src)
+        os.remove(os.path.join(src, "README"))
+        _git(src, "rm", "--cached", "README")  # index empty, HEAD still has it
+        self.assertEqual(_git(src, "ls-files").stdout, "")
+        plan = source_layout.migrate_plan(self.therock, self.aomp)
+        source_layout.apply_migration(self.therock, plan)
+        dest = os.path.join(self.therock, LLVM.therock_path)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "README")),
+                        "empty working tree should be repopulated from HEAD")
+
     def test_dry_run_moves_nothing(self):
         src = os.path.join(self.aomp, LLVM.aomp_dir)
         _init_repo(src)

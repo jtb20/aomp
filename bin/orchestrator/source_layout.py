@@ -243,3 +243,13 @@ def apply_migration(
         if init.returncode != 0:
             log(f"    note: 'git submodule init {act.comp.therock_path}' "
                 f"failed; reconcile with TheRock's fetch_sources.py")
+        # 5. If the AOMP checkout's working tree came over empty (a repo whose
+        #    files were never checked out, e.g. cloned --no-checkout), HEAD has
+        #    files but the index/worktree are empty. A later submodule update is
+        #    a no-op when HEAD already matches the pinned SHA, so the build would
+        #    not find the sources. Populate from HEAD now (safe: nothing to lose
+        #    in an empty tree).
+        if not _git_out(act.dest_path, "ls-files"):
+            checkout = _git(act.dest_path, "checkout", "-f", "HEAD")
+            if checkout.returncode == 0:
+                log("    (populated empty working tree from HEAD)")
