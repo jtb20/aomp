@@ -29,6 +29,7 @@ components, the same order, but introspectable, incremental, and scriptable.
 - [Sharding](#sharding)
 - [TheRock backend](#therock-backend)
 - [Logs](#logs)
+- [Sharing sources between AOMP and TheRock](#sharing-sources-between-aomp-and-therock)
 - [User workflows](#user-workflows)
 - [Internals](#internals)
   - [The taskified component interface](#the-taskified-component-interface)
@@ -914,6 +915,84 @@ The `list` selector reflects this with a colored mark:
 index being run through to the end, *before* executing. So a full build (no
 selector) resets all stamps, and running a subset or `continue` resets that
 point onward. Deleting the `stamps/` directory also resets everything.
+
+---
+
+## Sharing sources between AOMP and TheRock
+
+AOMP keeps each component as its own standalone repo under `AOMP_REPOS`; TheRock
+keeps them as submodules of a single checkout. A handful of components are
+standalone git repos in *both* layouts and can therefore be shared 1:1. TheRock
+is treated as the canonical layout (AOMP builds move toward it, and it is mostly
+a superset).
+
+The shared set (AOMP path → TheRock path, submodule name, expected branch):
+
+| AOMP `AOMP_REPOS/…`     | TheRock path                       | submodule              | branch                  |
+| ----------------------- | ---------------------------------- | ---------------------- | ----------------------- |
+| `llvm-project`          | `compiler/amd-llvm`                | `llvm-project`         | `amd-staging`           |
+| `rocm-cmake`            | `base/rocm-cmake`                  | `rocm-cmake`           | `mainline`              |
+| `hipify`                | `compiler/hipify`                  | `HIPIFY`               | `amd-staging`           |
+| `ROCgdb`                | `debug-tools/rocgdb/source`        | `rocgdb`               | `amd-staging-rocgdb-16` |
+| `rocmlibs/half`         | `base/half`                        | `half`                 | `rocm`                  |
+| `SPIRV-LLVM-Translator` | `compiler/spirv-llvm-translator`   | `spirv-llvm-translator`| `amd-staging`           |
+
+`llvm-project` also backs AOMP's `project` / `comgr` / `hipcc` via subpaths, so
+those resolve through the single shared checkout.
+
+The monorepo-backed components (TheRock's `rocm-systems` / `rocm-libraries`
+submodules, which AOMP keeps as separate repos) are **not** in the 1:1 set and
+stay managed by `clone_aomp.sh` / `clone_rocmlibs.sh` (AOMP) and
+`fetch_sources.py` (TheRock).
+
+These provisioning steps run **once**, after component resolution and before any
+build work. `-s/--source` is always the **destination** root.
+
+### `--clone` (AOMP)
+
+Clone the AOMP sources into `-s/--source` via `clone_aomp.sh`. When the selected
+set includes any `rocmlibs` components, `rocmlibs/clone_rocmlibs.sh` is run too.
+
+```bash
+./aomp_build.py -s ~/git/aomp --clone list      # provision, then list
+```
+
+### `--therock-symlinks DIR` (AOMP)
+
+Provision `-s/--source` by **symlinking** the shared standalone repos from the
+TheRock checkout `DIR`, then clone the remaining AOMP-only repos with
+`clone_aomp.sh` (which skips any dir that is already a symlink, so the canonical
+TheRock tree is never mutated by a clone/pull). Whole-repo directory symlinks are
+used (not a per-file shadow tree): git, edits and add/remove all resolve to the
+real repo.
+
+```bash
+./aomp_build.py -s ~/git/aomp --therock-symlinks ~/code/TheRock
+```
+
+A shared slot that is missing in the TheRock checkout (submodule not fetched) is
+warned and left to `clone_aomp.sh`; an existing **real** directory in
+`AOMP_REPOS` is never clobbered.
+
+### `--migrate-aomp REPODIR` (TheRock)
+
+Pre-seed TheRock's submodule slots by **moving** the shared repos out of an
+existing AOMP checkout `REPODIR` into `-s/--source`'s TheRock checkout,
+converting each standalone repo into a submodule gitdir (the repo's `.git` moves
+to `<therock>/.git/modules/<name>` and a gitlink `.git` file is written). This is
+**destructive** (directories are moved) and prompts for confirmation unless
+`-y/--yes` is given; `-n/--dry-run` previews the plan without moving anything.
+
+```bash
+therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp -n   # preview
+therock_build.py -s ~/git/srock --migrate-aomp ~/git/aomp      # move (prompts)
+```
+
+Per-repo pre-flight skips a slot that is missing in the AOMP checkout, is not a
+git repo, or whose TheRock slot is already populated. Uncommitted changes move
+with the tree, and a branch that differs from TheRock's expected branch is
+warned but allowed — the recorded submodule SHA is reconciled by TheRock's next
+`fetch_sources.py` / configure.
 
 ---
 

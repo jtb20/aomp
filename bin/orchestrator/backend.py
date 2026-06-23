@@ -106,6 +106,17 @@ class Backend(ABC):
         component's checkbox as done. Default: None (e.g. the AOMP backend)."""
         return None
 
+    def provision_sources(
+        self, args: argparse.Namespace, env: dict[str, str],
+        components: list[str],
+    ) -> int:
+        """Pre-build source provisioning hook (--clone / --therock-symlinks /
+        --migrate-aomp). Runs once after component resolution, before any task
+        elaboration. `components` is the resolved, ordered component list (used
+        e.g. to decide whether rocmlibs need cloning). Returns an exit code:
+        non-zero aborts the run. The default does nothing."""
+        return 0
+
     def prepare_run(
         self, selected_comps: set[str], env: dict[str, str],
         args: argparse.Namespace,

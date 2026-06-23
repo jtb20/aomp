@@ -27,7 +27,7 @@ import re
 import shutil
 import subprocess
 
-from . import core, topology
+from . import core, source_layout, topology
 from .backend import Backend
 from .model import Config, Package, RawTask, Task
 
@@ -896,6 +896,69 @@ class TheRockBackend(Backend):
             return bin_rel[: -len("build")] + "stage"
         head = bin_rel.rsplit("/", 1)[0] if "/" in bin_rel else ""
         return (head + "/stage") if head else "stage"
+
+    def provision_sources(
+        self, args: argparse.Namespace, env: dict[str, str],
+        components: list[str],
+    ) -> int:
+        """--migrate-aomp REPODIR: MOVE the shared standalone repos out of the
+        AOMP checkout REPODIR into this TheRock checkout's submodule slots
+        (-s/--source resolves to SROCK_THEROCK_DIR), converting each into a
+        submodule gitdir. Destructive; gated by a confirmation prompt."""
+        repodir = getattr(args, "migrate_aomp", None)
+        if not repodir:
+            return 0
+
+        aomp_repodir = os.path.abspath(os.path.expanduser(repodir))
+        therock_dir = self.discover_env(env)["SROCK_THEROCK_DIR"]
+        dry = getattr(args, "dry_run", False)
+
+        if not source_layout.is_git_repo(therock_dir):
+            core._fail(
+                f"--migrate-aomp: destination '{therock_dir}' is not a git "
+                f"checkout of TheRock (set -s/--source or --therock-dir)"
+            )
+
+        plan = source_layout.migrate_plan(therock_dir, aomp_repodir)
+        print(f"--- migrate AOMP sources: {aomp_repodir} -> {therock_dir} ---")
+        ready = [a for a in plan if a.status == "ready"]
+        reason = {
+            "missing-source": "no such repo in the AOMP checkout",
+            "not-git": "not a git repository",
+            "dest-occupied": "destination slot already populated",
+        }
+        for act in plan:
+            if act.status == "ready":
+                print(f"  move {act.comp.aomp_dir} -> {act.comp.therock_path}")
+                for w in act.warnings:
+                    print(f"      warning: {w}")
+            else:
+                print(f"  skip {act.comp.aomp_dir}: {reason[act.status]}")
+
+        if not ready:
+            print("nothing to migrate.")
+            return 0
+
+        if dry:
+            print("(dry-run) no directories moved.")
+            return 0
+
+        if not getattr(args, "yes", False):
+            print(f"\nThis MOVES {len(ready)} repo(s) out of the AOMP checkout "
+                  f"into TheRock's submodule slots (the AOMP locations will no "
+                  f"longer exist).")
+            try:
+                reply = input("Proceed? [y/N] ").strip().lower()
+            except EOFError:
+                reply = ""
+            if reply not in ("y", "yes"):
+                print("aborted.")
+                return 1
+
+        source_layout.apply_migration(therock_dir, plan, dry_run=dry)
+        print("migration complete; run TheRock's fetch_sources.py / a configure "
+              "to reconcile recorded submodule SHAs.")
+        return 0
 
     def prepare_run(
         self, selected_comps: set[str], env: dict[str, str],
