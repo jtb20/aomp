@@ -757,7 +757,10 @@ A component is reported `[pinned]` only when it has a valid (built) TheRock
 `stage/` dir — exactly the components `buildctl.py` would mark prebuilt. The
 checkbox reflects TheRock's build state too: a component with a valid stage dir
 renders as done (`[✓]`) even if this orchestrator never ran its task, so a
-`[pinned]` row is never blank. `--rdeps` applies to the preview as well (place flags before the
+`[pinned]` row is never blank. Bare `continue` uses the same combined notion of
+"done" (orchestrator stamp **or** a valid stage dir), so it resumes past
+components TheRock already staged rather than rebuilding them. `--rdeps` applies
+to the preview as well (place flags before the
 selectors, e.g. `therock_build.py --rdeps list amd-llvm`): the dependents then
 show as buildable rather than `[pinned]`. A bare `list` (no trailing selectors)
 previews a full build and pins nothing.

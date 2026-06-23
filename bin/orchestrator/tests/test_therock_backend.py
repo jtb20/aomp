@@ -27,9 +27,41 @@ if BIN_DIR not in sys.path:
     sys.path.insert(0, BIN_DIR)
 
 from orchestrator import core, topology  # noqa: E402
+from orchestrator.model import Task  # noqa: E402
 from orchestrator.therock_backend import (  # noqa: E402
     DEFAULT_CHILD_PATH, DEFAULT_CONFIG, TheRockBackend,
 )
+
+
+class TaskIsDoneTests(unittest.TestCase):
+    """`continue`/`list` completion honors both stamps and built_components."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _task(self, comp: str) -> Task:
+        return Task(comp=comp, action="build", cfgname=None, single_config=True)
+
+    def test_done_via_stamp(self) -> None:
+        task = self._task("amd-llvm")
+        with open(core.stamp_path(self.tmp, task, "done"), "w") as fh:
+            fh.write("x")
+        self.assertTrue(core.task_is_done(self.tmp, task, built=None))
+
+    def test_done_via_built_components_without_stamp(self) -> None:
+        # No stamp, but the backend reports the component as built (staged) ->
+        # done, so bare `continue` skips it instead of rebuilding.
+        task = self._task("amd-llvm")
+        self.assertEqual(core.task_state(self.tmp, task), "none")
+        self.assertTrue(core.task_is_done(self.tmp, task, built={"amd-llvm"}))
+
+    def test_not_done_when_neither(self) -> None:
+        task = self._task("amd-llvm")
+        self.assertFalse(core.task_is_done(self.tmp, task, built={"rocm-cmake"}))
+        self.assertFalse(core.task_is_done(self.tmp, task, built=None))
 
 # A real TheRock checkout (with BUILD_TOPOLOGY.toml + build_tools) for the
 # topology tests; skipped if not present.
