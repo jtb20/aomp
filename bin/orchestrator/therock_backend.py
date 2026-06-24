@@ -1614,6 +1614,29 @@ class TheRockBackend(Backend):
             })
         return rows
 
+    def rest_build_shards(
+        self, import_shards: list[str], env: dict[str, str],
+    ) -> list[str] | None:
+        """Every configured artifact group not in ``import_shards``, in build
+        order (for -f/--fill).
+
+        "Configured" means the group has at least one subproject in the current
+        configure -- exactly what `list-shards` reports as ``configured`` (an
+        empty group is feature-disabled in this profile). Imported groups are
+        provided as artifacts, so they are excluded from the build set (the
+        shard pipeline still pins them). Returns None when no topology is
+        available."""
+        topo = self._load_topology(env)
+        if topo is None:
+            return None
+        sub_group = self._subproject_group_map(topo)
+        configured = {g for groups in sub_group.values() for g in groups}
+        skip = set(import_shards)
+        return [
+            g for g in topology.group_names(topo)
+            if g in configured and g not in skip
+        ]
+
     def shard_tasks(
         self, tasks: list[Task], import_shards: list[str],
         build_shards: list[str], export_shards: list[str],
