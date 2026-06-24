@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 
 from .backend import Backend
@@ -325,85 +326,75 @@ def select_tasks(tasks: list[Task], selectors: list[str]) -> list[int]:
     return selected
 
 
-def partition_shard(num_tasks: int, k: int, n: int) -> list[int]:
-    """Indices belonging to shard k of n over a topologically ordered task list.
+def parse_shard_list(spec: str | None) -> list[str]:
+    """Split a comma-separated shard option into an ordered, de-duplicated list.
 
-    The flat task list is already in dependency order, so contiguous segments
-    are dependency-respecting: running shards 1..n in order reproduces a full
-    build, and a single shard's segment can run on its own machine provided the
-    earlier shards' outputs (shared source/build/install tree) are present.
-    Segments are balanced by task count (earlier shards get the +1 remainder).
+    Empty/whitespace entries are dropped. Returns [] for None or "" so callers
+    can treat "option not given" and "given empty" alike.
     """
-    if n <= 0:
-        _fail("--shard N must be >= 1")
-    if not (1 <= k <= n):
-        _fail(f"--shard k must be in 1..{n} (got {k})")
-    base, extra = divmod(num_tasks, n)
-    # Segment sizes: first `extra` shards get base+1, the rest get base.
-    start = 0
-    bounds: list[tuple[int, int]] = []
-    for i in range(n):
-        size = base + (1 if i < extra else 0)
-        bounds.append((start, start + size))
-        start += size
-    lo, hi = bounds[k - 1]
-    return list(range(lo, hi))
-
-
-def partition_shard_aligned(
-    num_tasks: int, run_lengths: list[int], k: int, n: int
-) -> list[int]:
-    """Like partition_shard, but snap the N cut points to run boundaries.
-
-    `run_lengths` are the lengths of contiguous runs (summing to num_tasks) that
-    a shard boundary should not split -- for TheRock these are build stages. We
-    compute the ideal balanced cut positions (i*num_tasks/n) and move each to the
-    nearest cumulative run boundary, keeping cuts strictly increasing so every
-    shard is a contiguous, non-empty-where-possible segment in dependency order.
-    Falls back to the plain count-based partition when the runs are unusable.
-    """
-    if n <= 0:
-        _fail("--shard N must be >= 1")
-    if not (1 <= k <= n):
-        _fail(f"--shard k must be in 1..{n} (got {k})")
-    if sum(run_lengths) != num_tasks or any(r <= 0 for r in run_lengths):
-        return partition_shard(num_tasks, k, n)
-
-    # Cumulative run boundaries (candidate cut positions), excluding 0/num_tasks.
-    boundaries = []
-    acc = 0
-    for length in run_lengths[:-1]:
-        acc += length
-        boundaries.append(acc)
-
-    cuts = [0]
-    used: set[int] = set()
-    for i in range(1, n):
-        ideal = round(i * num_tasks / n)
-        # Snap to the nearest unused boundary; if all are taken, keep splitting
-        # at the ideal position so we still produce n segments.
-        candidate = min(
-            (b for b in boundaries if b not in used),
-            key=lambda b: (abs(b - ideal), b),
-            default=ideal,
-        )
-        if candidate <= cuts[-1]:
-            candidate = min(cuts[-1] + 1, num_tasks)
-        used.add(candidate)
-        cuts.append(candidate)
-    cuts.append(num_tasks)
-    lo, hi = cuts[k - 1], cuts[k]
-    return list(range(lo, hi))
-
-
-def parse_shard(spec: str | None) -> tuple[int, int] | None:
-    """Parse a --shard 'k/N' spec into (k, N), or None when not given."""
     if not spec:
-        return None
-    m = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", spec)
-    if not m:
-        _fail(f"--shard expects 'k/N' (e.g. 2/4), got '{spec}'")
-    return int(m.group(1)), int(m.group(2))
+        return []
+    out: list[str] = []
+    for tok in spec.split(","):
+        name = tok.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def print_shard_catalog(rows: list[dict]) -> None:
+    """Pretty-print the shard catalog for `list-shards`.
+
+    Shards are TheRock artifact groups, printed in dependency (build) order as a
+    vertical block each so the output stays within the terminal width. A short
+    legend explains the fields, and long comma-lists wrap with hanging indent.
+    """
+    cols = shutil.get_terminal_size((80, 24)).columns
+    label_w = len("artifacts")  # widest field label, for aligned ": " columns
+    indent = "  "
+    hang = indent + " " * (label_w + 2)  # continuation indent past "label : "
+
+    def field(label: str, value: str) -> None:
+        prefix = f"{indent}{label:<{label_w}} : "
+        avail = max(20, cols - len(prefix))
+        wrapped = textwrap.wrap(value, width=avail) or [""]
+        print(prefix + wrapped[0])
+        for cont in wrapped[1:]:
+            print(hang + cont)
+
+    print("Shards are TheRock artifact groups, in build order. Pick names for")
+    print("--import-shard / --build-shard / --export-shard.\n")
+    print("  builds    subprojects this group builds (from the current "
+          "configure)")
+    print("  imports   dependency groups to import first (use as --import-shard)")
+    print("  sources   source sets fetched for this group (fetch_sources.py)")
+    print("  artifacts count produced (exported) / consumed from upstream\n")
+
+    for r in rows:
+        name = r["name"]
+        header = name
+        if r.get("description"):
+            header += f"  - {r['description']}"
+        print(header)
+
+        subs = r.get("subprojects") or []
+        if subs:
+            field("builds", ", ".join(subs) + f"  ({len(subs)})")
+        else:
+            # artifact_map.json only carries enabled artifacts, so an empty set
+            # means this group's subprojects are off in the current profile.
+            field("builds", "(no subprojects in the current configure)")
+
+        deps = r.get("depends_on") or []
+        field("imports", ", ".join(deps) if deps else "(none)")
+
+        sources = r.get("source_sets") or []
+        if sources:
+            field("sources", ", ".join(sources))
+
+        field("artifacts",
+              f"{r.get('produced', 0)} produced, {r.get('inbound', 0)} inbound")
+        print()
 
 
 # --------------------------------------------------------------------------- #
@@ -960,6 +951,9 @@ def build_arg_parser(
             "  list-features print the backend's configurable features and exit\n"
             "                  (TheRock: THEROCK_ENABLE_* features; enable one\n"
             "                  with --add <name> --reconfigure)\n"
+            "  list-shards   print the backend's shard catalog and exit\n"
+            "                  (TheRock: BUILD_TOPOLOGY.toml artifact groups;\n"
+            "                  drive one with --import/build/export-shard)\n"
             "  N             run task number N (1-based)\n"
             "  N--M          run the inclusive range of tasks N..M\n"
             "  comp/variant/stage  glob/substring match (supports {a,b} braces);\n"
@@ -1009,11 +1003,6 @@ def build_arg_parser(
                              "variant are skipped (so '--variant default' skips "
                              "the runtimes). With no --variant, all advertised "
                              "configs are built.")
-    parser.add_argument("--shard", default=None, metavar="k/N",
-                        help="run shard k of N: split the elaborated, dependency-"
-                             "ordered task list into N balanced contiguous "
-                             "segments and run the k-th (e.g. '2/4'). Composes "
-                             "with selectors and stamps.")
     parser.add_argument("-C", "--clean", action="store_true",
                         help="prepend an 'install/clean' task that wipes the "
                              "install directory (the versioned symlink target, "
@@ -1126,6 +1115,57 @@ def add_backend_options(
              "rocgdb).",
     )
 
+    shard = parser.add_argument_group(
+        "group-based sharding (--backend therock)"
+    )
+    shard.add_argument(
+        "--import-shard", default=None, metavar="LIST",
+        help="comma-separated producer shard(s) (artifact groups) whose "
+             "artifacts to import into the build tree before building, e.g. "
+             "'compiler'. Pulled from --shard-store and unpacked as prebuilt "
+             "via TheRock's buildctl.py bootstrap. See `list-shards`.",
+    )
+    shard.add_argument(
+        "--build-shard", default=None, metavar="LIST",
+        help="comma-separated shard(s) (artifact groups) to build, e.g. "
+             "'hip-runtime'. Only the named groups' subprojects build; their "
+             "sources are fetched (fetch_sources.py --source-sets) for just "
+             "those groups.",
+    )
+    shard.add_argument(
+        "--export-shard", default=None, metavar="LIST",
+        help="comma-separated producer shard(s) (artifact groups) whose built "
+             "artifacts to export to --shard-store after building.",
+    )
+    shard.add_argument(
+        "--export-shards", action="store_true",
+        help="export the artifacts of every shard named by --build-shard "
+             "(sugar so the build set need not be repeated in --export-shard).",
+    )
+    shard.add_argument(
+        "--shard-store", default=None, metavar="DIR",
+        help="local artifact store for shard import/export (TheRock's "
+             "THEROCK_LOCAL_STAGING_DIR). Default: <BUILD_DIR>/shard-artifacts.",
+    )
+    shard.add_argument(
+        "--shard-run-id", default="local", metavar="LABEL",
+        help="run-id namespace under --shard-store for push/fetch "
+             "(default: 'local').",
+    )
+    shard.add_argument(
+        "--shard-families", default=None, metavar="LIST",
+        help="comma-separated target families to import in addition to "
+             "'generic' (e.g. 'gfx94X'), for per-arch artifacts on "
+             "--import-shard. Default: generic only.",
+    )
+    shard.add_argument(
+        "--deploy", action="store_true",
+        help="in shard mode, also assemble the imported + built shards into the "
+             "combined dist tree and the final install dir (re-enables the "
+             "trailing therock/dist + therock/install steps that a shard run "
+             "otherwise skips). No effect outside shard mode.",
+    )
+
     prov = parser.add_argument_group(
         "source provisioning (run once, before building)"
     )
@@ -1207,6 +1247,21 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
             print(line)
         return 0
 
+    # `list-shards` selector: print the backend's shard catalog (TheRock
+    # artifact groups) and exit. Shows each group's subprojects, dependency
+    # groups, and artifact counts so the user can pick shard names.
+    if args.selectors and args.selectors[0] == "list-shards":
+        rows = backend.list_shards(child_env)
+        if rows is None:
+            print(f"{PROG}: this backend has no shard concept")
+            return 0
+        if not rows:
+            print(f"{PROG}: no shards found "
+                  f"(needs a TheRock checkout with BUILD_TOPOLOGY.toml)")
+            return 0
+        print_shard_catalog(rows)
+        return 0
+
     components = resolve_components(cfg, args.add, args.remove)
 
     # Source provisioning (--clone / --therock-symlinks / --migrate-aomp) runs
@@ -1254,15 +1309,45 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
             _fail("this backend does not support -C/--clean")
         tasks.insert(0, clean_task)
 
-    # Leading whole-build pseudo-tasks (e.g. TheRock's `therock/prereq`, which
-    # builds the cmake/ninja toolchain) run before every per-component task so a
-    # full build sets up its prerequisites first, with output captured to a log.
-    tasks = backend.leading_tasks(components, child_env) + tasks
+    # Group-based sharding: when any --import/build/export-shard option is given,
+    # the task list becomes the backend's import->build->export pipeline for the
+    # named artifact groups instead of the normal whole-tree run. --export-shards
+    # is sugar for "export every build shard". The leading prereq still runs (it
+    # only builds the cmake/ninja toolchain); the trailing whole-tree dist/
+    # install is suppressed (a shard run produces/pushes artifacts, it does not
+    # assemble the full SDK) unless --deploy asks to assemble them.
+    shard_import = parse_shard_list(getattr(args, "import_shard", None))
+    shard_build = parse_shard_list(getattr(args, "build_shard", None))
+    shard_export = parse_shard_list(getattr(args, "export_shard", None))
+    if getattr(args, "export_shards", False):
+        shard_export += [s for s in shard_build if s not in shard_export]
+    shard_mode = bool(shard_import or shard_build or shard_export)
 
-    # Whole-build pseudo-tasks (e.g. TheRock's combined dist + final install)
-    # are appended after every per-component task so they run last on a full
-    # build and can be selected by name (e.g. 'therock/install').
-    tasks += backend.trailing_tasks(components, child_env)
+    if shard_mode:
+        pipeline = backend.shard_tasks(
+            tasks, shard_import, shard_build, shard_export, child_env, args,
+        )
+        if pipeline is None:
+            _fail("this backend does not support group-based sharding "
+                  "(--import-shard / --build-shard / --export-shard)")
+        tasks = backend.leading_tasks(components, child_env) + pipeline
+        # --deploy re-enables the trailing whole-tree dist + install steps so a
+        # shard run also assembles the imported + freshly-built shards into the
+        # combined dist tree and the final install dir (otherwise a shard run
+        # only produces/pushes artifacts).
+        if getattr(args, "deploy", False):
+            tasks += backend.trailing_tasks(components, child_env)
+    else:
+        # Leading whole-build pseudo-tasks (e.g. TheRock's `therock/prereq`,
+        # which builds the cmake/ninja toolchain) run before every per-component
+        # task so a full build sets up its prerequisites first, with output
+        # captured to a log.
+        tasks = backend.leading_tasks(components, child_env) + tasks
+
+        # Whole-build pseudo-tasks (e.g. TheRock's combined dist + final
+        # install) are appended after every per-component task so they run last
+        # on a full build and can be selected by name (e.g. 'therock/install').
+        tasks += backend.trailing_tasks(components, child_env)
 
     # `list` selector: print the numbered task list and exit. A green check
     # marks completed tasks (or ones already built in the backend), a red cross
@@ -1308,20 +1393,6 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
     else:
         indices = select_tasks(tasks, args.selectors)
 
-    # --shard k/N narrows the selection to the k-th dependency-ordered segment.
-    # A backend may supply contiguous run boundaries (e.g. TheRock build stages)
-    # for the cut points to snap to; otherwise the segments are balanced purely
-    # by task count.
-    shard = parse_shard(args.shard)
-    if shard is not None:
-        k, n = shard
-        runs = backend.shard_run_lengths(tasks, child_env)
-        if runs:
-            shard_idx = set(partition_shard_aligned(len(tasks), runs, k, n))
-        else:
-            shard_idx = set(partition_shard(len(tasks), k, n))
-        indices = [i for i in indices if i in shard_idx]
-
     if not indices:
         print(f"{PROG}: no tasks selected")
         return 0
@@ -1342,8 +1413,11 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
 
     # Let the backend adjust build state for exactly the components about to
     # run (e.g. TheRock marks out-of-scope components prebuilt so a focused
-    # subset build does not cascade rebuilds into dependents).
-    backend.prepare_run({tasks[i].comp for i in indices}, child_env, args)
+    # subset build does not cascade rebuilds into dependents). Skipped in shard
+    # mode: the shard pipeline pins + reconfigures *after* its imports (the
+    # generic auto-pin here would run too early, before anything is staged).
+    if not shard_mode:
+        backend.prepare_run({tasks[i].comp for i in indices}, child_env, args)
 
     return run_tasks(
         backend, tasks, indices, child_env, log_dir, args.dry_run,

@@ -3,7 +3,7 @@
 
 Synthetic-fixture tests (no real TheRock build) covering the full flow:
 introspection JSON -> Config graph -> elaborated tasks -> ninja commands ->
-sharding. Run directly or via unittest:
+stage-based sharding. Run directly or via unittest:
 
     python3 bin/orchestrator/tests/test_therock_backend.py
     python3 -m unittest discover -s bin/orchestrator/tests
@@ -26,7 +26,7 @@ BIN_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file
 if BIN_DIR not in sys.path:
     sys.path.insert(0, BIN_DIR)
 
-from orchestrator import core, topology  # noqa: E402
+from orchestrator import core, shard_artifacts, topology  # noqa: E402
 from orchestrator.model import Task  # noqa: E402
 from orchestrator.therock_backend import (  # noqa: E402
     DEFAULT_CHILD_PATH, DEFAULT_CONFIG, TheRockBackend,
@@ -95,6 +95,16 @@ FIXTURE = {
         "compiler_toolchain": "THEROCK_COMPILER_TOOLCHAIN-NOTFOUND",
         "actions": ["configure", "build", "stage", "dist", "expunge"],
     },
+}
+
+# artifact_map.json companion: maps each topology artifact to the FIXTURE
+# subprojects that compose it. Joined with BUILD_TOPOLOGY.toml's artifact->group
+# relation, this maps subprojects onto artifact groups (the shard unit):
+#   amd-llvm   -> group 'compiler', rocm-cmake -> 'base', hipBLAS -> 'math-libs'.
+ARTIFACT_FIXTURE = {
+    "amd-llvm": ["amd-llvm"],
+    "base": ["rocm-cmake"],
+    "blas": ["hipBLAS"],
 }
 
 
@@ -194,16 +204,6 @@ class TheRockFixtureTest(unittest.TestCase):
         self.assertEqual(cmd[:3], ["ninja", "-C", self.build])
         self.assertEqual(cmd[3], "hipBLAS+build")
         self.assertEqual(extra, {})
-
-    def test_count_based_shard_partition(self) -> None:
-        # 9 tasks (3 components x 3 actions) into 3 shards -> 3 each.
-        self.assertEqual(core.partition_shard(9, 1, 3), [0, 1, 2])
-        self.assertEqual(core.partition_shard(9, 2, 3), [3, 4, 5])
-        self.assertEqual(core.partition_shard(9, 3, 3), [6, 7, 8])
-        union: list[int] = []
-        for k in (1, 2, 3):
-            union += core.partition_shard(9, k, 3)
-        self.assertEqual(union, list(range(9)))
 
     def test_src_dir_and_externals(self) -> None:
         backend, args, _ = self._load()
@@ -917,6 +917,17 @@ class InjectIntrospectionTest(unittest.TestCase):
         self.cmakelists = os.path.join(self.therock, "CMakeLists.txt")
         with open(self.cmakelists, "w") as fh:
             fh.write("cmake_minimum_required(VERSION 3.25)\nproject(TheRock)\n")
+        # A stock-ish therock_artifacts.cmake carrying the anchor line that the
+        # artifact-deps property injection hooks onto.
+        self.artifacts_cmake = os.path.join(
+            self.therock, "cmake", "therock_artifacts.cmake")
+        with open(self.artifacts_cmake, "w") as fh:
+            fh.write(
+                "function(therock_provide_artifact slice_name)\n"
+                '  set(_target_name "artifact-${slice_name}")\n'
+                '  add_dependencies(therock-artifacts "${_target_name}")\n'
+                "endfunction()\n"
+            )
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -937,31 +948,112 @@ class InjectIntrospectionTest(unittest.TestCase):
             text2.count("therock_introspect_subprojects()"), 1
         )
 
+    def test_records_artifact_subproject_deps_once(self) -> None:
+        backend = TheRockBackend()
+        backend._inject_introspection(self.therock)
+        text = open(self.artifacts_cmake).read()
+        # The property is recorded right after the anchor.
+        self.assertIn("THEROCK_ARTIFACT_SUBPROJECT_DEPS", text)
+        anchor = '  add_dependencies(therock-artifacts "${_target_name}")\n'
+        self.assertIn(anchor + "  # >>> srock orchestrator", text)
+        # Idempotent: a second injection does not duplicate the property.
+        backend._inject_introspection(self.therock)
+        text2 = open(self.artifacts_cmake).read()
+        self.assertEqual(text2.count("THEROCK_ARTIFACT_SUBPROJECT_DEPS"), 1)
+
+    def test_artifact_deps_injection_best_effort_without_file(self) -> None:
+        # No therock_artifacts.cmake -> injection is skipped, not fatal.
+        os.remove(self.artifacts_cmake)
+        backend = TheRockBackend()
+        backend._inject_introspection(self.therock)
+        self.assertFalse(os.path.isfile(self.artifacts_cmake))
+
     def test_rejects_non_checkout(self) -> None:
         backend = TheRockBackend()
         with self.assertRaises(SystemExit):
             backend._inject_introspection(os.path.join(self.tmp, "nope"))
 
 
-class PartitionAlignedTest(unittest.TestCase):
-    def test_cuts_snap_to_run_boundaries(self) -> None:
-        # Runs of sizes [3,3,3,3] = 12 tasks; 2 shards should cut at task 6.
-        shard1 = core.partition_shard_aligned(12, [3, 3, 3, 3], 1, 2)
-        shard2 = core.partition_shard_aligned(12, [3, 3, 3, 3], 2, 2)
-        self.assertEqual(shard1, list(range(0, 6)))
-        self.assertEqual(shard2, list(range(6, 12)))
+class ShardArtifactsHelperTest(unittest.TestCase):
+    """The import-bootstrap store filter selects only the named producers."""
 
-    def test_uneven_runs_prefer_boundaries(self) -> None:
-        # Runs [5,1,6] = 12; ideal cut at 6 snaps to boundary 6 (5+1).
-        shard1 = core.partition_shard_aligned(12, [5, 1, 6], 1, 2)
-        self.assertEqual(shard1, list(range(0, 6)))
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="shard-store-")
+        # A nested store as artifact_manager push would write it (run-id /
+        # platform prefix), mixing archives and an exploded dir.
+        self.store = os.path.join(self.tmp, "store")
+        nested = os.path.join(self.store, "local", "linux")
+        os.makedirs(nested)
+        for fname in (
+            "core-runtime_lib_generic.tar.zst",
+            "amd-llvm_compiler_generic.tar.xz",
+            "blas_lib_gfx94X.tar.zst",
+        ):
+            open(os.path.join(nested, fname), "w").close()
+        os.makedirs(os.path.join(nested, "hip-clr_dev_generic"))  # exploded dir
+        open(os.path.join(nested, "notanartifact.txt"), "w").close()
 
-    def test_falls_back_when_runs_invalid(self) -> None:
-        # Run lengths that don't sum to num_tasks -> count-based partition.
-        self.assertEqual(
-            core.partition_shard_aligned(12, [3, 3], 1, 3),
-            core.partition_shard(12, 1, 3),
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_matches_by_artifact_name_archives_and_dirs(self) -> None:
+        got = shard_artifacts.find_matching_artifacts(
+            self.store, {"core-runtime", "hip-clr"}
         )
+        names = sorted(os.path.basename(p) for p in got)
+        self.assertEqual(
+            names, ["core-runtime_lib_generic.tar.zst", "hip-clr_dev_generic"]
+        )
+
+    def test_ignores_unrelated_and_nonartifact_files(self) -> None:
+        got = shard_artifacts.find_matching_artifacts(self.store, {"blas"})
+        self.assertEqual(
+            [os.path.basename(p) for p in got], ["blas_lib_gfx94X.tar.zst"]
+        )
+        # A name with no matching archive/dir yields nothing.
+        self.assertEqual(
+            shard_artifacts.find_matching_artifacts(self.store, {"nope"}), []
+        )
+
+    def test_export_local_copies_named_artifacts(self) -> None:
+        # build/artifacts holds exploded {name}_{component}_{family} dirs; only
+        # those whose name is in --names are copied into the (flat) store.
+        build_dir = os.path.join(self.tmp, "build")
+        artifacts = os.path.join(build_dir, "artifacts")
+        os.makedirs(artifacts)
+        for d in ("compiler_lib_generic", "compiler_dev_generic",
+                  "base_lib_generic"):
+            os.makedirs(os.path.join(artifacts, d))
+            open(os.path.join(artifacts, d, "artifact_manifest.txt"), "w").close()
+        open(os.path.join(artifacts, "scratch.fprint"), "w").close()
+        out_store = os.path.join(self.tmp, "out-store")
+        rc = shard_artifacts.main([
+            "export-local", "--build-dir", build_dir,
+            "--store", out_store, "--names", "compiler",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            sorted(os.listdir(out_store)),
+            ["compiler_dev_generic", "compiler_lib_generic"],
+        )
+        # The copied dir keeps its contents; the round-trips through the store
+        # matcher recover the artifact name.
+        self.assertTrue(os.path.isfile(os.path.join(
+            out_store, "compiler_lib_generic", "artifact_manifest.txt")))
+        self.assertEqual(
+            sorted(os.path.basename(p) for p in
+                   shard_artifacts.find_matching_artifacts(out_store, {"compiler"})),
+            ["compiler_dev_generic", "compiler_lib_generic"],
+        )
+
+    def test_export_local_no_match_fails(self) -> None:
+        build_dir = os.path.join(self.tmp, "build2")
+        os.makedirs(os.path.join(build_dir, "artifacts"))
+        rc = shard_artifacts.main([
+            "export-local", "--build-dir", build_dir,
+            "--store", os.path.join(self.tmp, "s2"), "--names", "nope",
+        ])
+        self.assertEqual(rc, 1)
 
 
 @unittest.skipUnless(
@@ -970,7 +1062,7 @@ class PartitionAlignedTest(unittest.TestCase):
     f"no TheRock checkout at {THEROCK_SRC}",
 )
 class TopologyShardTest(unittest.TestCase):
-    """Exercises the real build_topology adapter and stage-aligned sharding."""
+    """Exercises the real build_topology adapter and stage-based sharding."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="therock-topo-")
@@ -992,6 +1084,13 @@ class TopologyShardTest(unittest.TestCase):
         )
         with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
             json.dump(FIXTURE, fh)
+        # artifact -> composing subprojects, joined with the real topology's
+        # artifact->group relation to map the FIXTURE subprojects onto groups:
+        #   amd-llvm  -> artifact 'amd-llvm' (group 'compiler')
+        #   rocm-cmake-> artifact 'base'     (group 'base')
+        #   hipBLAS   -> artifact 'blas'     (group 'math-libs')
+        with open(os.path.join(self.build, "artifact_map.json"), "w") as fh:
+            json.dump(ARTIFACT_FIXTURE, fh)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1004,18 +1103,160 @@ class TopologyShardTest(unittest.TestCase):
         # rocm-libraries is a known submodule in the topology.
         self.assertIn("rocm-libraries", ranks)
 
-    def test_shard_run_lengths_partition_full_task_list(self) -> None:
+    def test_subproject_stage_maps_submodules_to_stages(self) -> None:
+        topo = topology.load_build_topology(self.therock)
+        sub_stage = topology.subproject_stage(topo)
+        stages = set(topology.stage_names(topo))
+        self.assertIn("rocm-libraries", sub_stage)
+        # Every mapped value is a real build stage.
+        self.assertTrue(set(sub_stage.values()) <= stages)
+
+    def test_subproject_group_map(self) -> None:
+        # artifact_map.json + topology artifact->group should map the FIXTURE
+        # subprojects onto their groups.
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        backend.load_config(args)
+        topo = topology.load_build_topology(self.therock)
+        sub_group = backend._subproject_group_map(topo)
+        self.assertEqual(sub_group.get("amd-llvm"), {"compiler"})
+        self.assertEqual(sub_group.get("rocm-cmake"), {"base"})
+        self.assertEqual(sub_group.get("hipBLAS"), {"math-libs"})
+
+    def test_list_shards_rows(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list-shards")
+        backend.load_config(args)
+        rows = backend.list_shards(backend.build_child_env(args))
+        self.assertIsNotNone(rows)
+        self.assertTrue(rows)
+        topo = topology.load_build_topology(self.therock)
+        # Shards are the artifact groups, in dependency (build) order.
+        self.assertEqual([r["name"] for r in rows], topology.group_names(topo))
+        for r in rows:
+            self.assertIn("name", r)
+            self.assertIsInstance(r["produced"], int)
+            self.assertIsInstance(r["inbound"], int)
+            self.assertIsInstance(r["subprojects"], list)
+            self.assertIsInstance(r["configured"], int)
+            self.assertIsInstance(r["source_sets"], list)
+            self.assertIsInstance(r["depends_on"], list)
+        by_name = {r["name"]: r for r in rows}
+        # The FIXTURE subprojects appear under their groups (config-derived).
+        self.assertIn("amd-llvm", by_name["compiler"]["subprojects"])
+        self.assertIn("rocm-cmake", by_name["base"]["subprojects"])
+        self.assertIn("hipBLAS", by_name["math-libs"]["subprojects"])
+        # The first group in build order depends on nothing upstream.
+        self.assertEqual(rows[0]["depends_on"], [])
+        # depends_on matches the topology's group dependencies.
+        for r in rows:
+            self.assertEqual(
+                r["depends_on"], topology.group_dependencies(topo, r["name"])
+            )
+
+    def test_shard_tasks_import_build_export_pipeline(self) -> None:
+        backend = TheRockBackend()
+        topo = topology.load_build_topology(self.therock)
+        # Build 'compiler' (amd-llvm), importing its dependency group(s).
+        build_group = "compiler"
+        import_group = topology.group_dependencies(topo, build_group)[0]
+        args = make_args(
+            self.therock, self.repos,
+            "--import-shard", import_group,
+            "--build-shard", build_group,
+            "--export-shards",
+            "list",
+        )
+        cfg = backend.load_config(args)
+        env = backend.build_child_env(args)
+        backend.discover_env(env)
+        components = core.resolve_components(cfg, args.add, args.remove)
+        tasks = core.elaborate_tasks(backend, cfg, components, env, [], {})
+        pipeline = backend.shard_tasks(
+            tasks, [import_group], [build_group], [build_group], env, args,
+        )
+        self.assertIsNotNone(pipeline)
+        names = [t.name for t in pipeline]
+        # Fetch precedes import precedes export; the build group's artifact
+        # target is produced via the native artifact-group-<g> ninja target.
+        self.assertIn("therock/fetch-sources", names)
+        self.assertIn(f"therock/import-{import_group}", names)
+        self.assertIn(f"therock/export-{build_group}", names)
+        self.assertIn(f"therock/artifact-group-{build_group}", names)
+        self.assertLess(
+            names.index("therock/fetch-sources"),
+            names.index(f"therock/import-{import_group}"),
+        )
+        self.assertLess(
+            names.index(f"therock/import-{import_group}"),
+            names.index(f"therock/export-{build_group}"),
+        )
+        # fetch uses --source-sets (group fetch), not --stage.
+        fetch = next(t for t in pipeline if t.name == "therock/fetch-sources")
+        self.assertIn("--source-sets", fetch.payload["argv"])
+        self.assertNotIn("--stage", fetch.payload["argv"])
+        # The import task argv carries the producer group's artifact names.
+        imp = next(t for t in pipeline
+                   if t.name == f"therock/import-{import_group}")
+        argv = imp.payload["argv"]
+        self.assertIn("import-bootstrap", argv)
+        self.assertIn("--names", argv)
+        produced = topology.group_produced_names(topo, import_group)
+        names_arg = argv[argv.index("--names") + 1]
+        self.assertEqual(set(names_arg.split(",")), produced)
+        # The export task is the helper's export-local for the build group.
+        exp = next(t for t in pipeline
+                   if t.name == f"therock/export-{build_group}")
+        self.assertIn("export-local", exp.payload["argv"])
+        exp_names = exp.payload["argv"][exp.payload["argv"].index("--names") + 1]
+        self.assertEqual(
+            set(exp_names.split(",")),
+            topology.group_produced_names(topo, build_group),
+        )
+
+    def test_unknown_shard_fails(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "--build-shard", "nope", "list")
+        cfg = backend.load_config(args)
+        env = backend.build_child_env(args)
+        with self.assertRaises(SystemExit):
+            backend.shard_tasks([], [], ["nope"], [], env, args)
+
+    def test_shard_pin_follows_imports_before_build(self) -> None:
+        # When the build group maps to real subprojects, a 'shard-pin' task
+        # (buildctl enable + reconfigure) is inserted after the imports and
+        # before the build subproject tasks, so the just-imported groups are
+        # pinned prebuilt for the build.
         backend = TheRockBackend()
         args = make_args(self.therock, self.repos, "list")
         cfg = backend.load_config(args)
         env = backend.build_child_env(args)
+        backend.discover_env(env)
+        topo = topology.load_build_topology(self.therock)
+        # 'compiler' (amd-llvm) is a build group; import one of its deps.
+        build_group = "compiler"
+        import_group = topology.group_dependencies(topo, build_group)[0]
         components = core.resolve_components(cfg, args.add, args.remove)
         tasks = core.elaborate_tasks(backend, cfg, components, env, [], {})
-        runs = backend.shard_run_lengths(tasks, env)
-        self.assertIsNotNone(runs)
-        # Runs are contiguous and cover exactly the task list.
-        self.assertEqual(sum(runs), len(tasks))
-        self.assertTrue(all(r > 0 for r in runs))
+        pipeline = backend.shard_tasks(
+            tasks, [import_group], [build_group], [], env, args,
+        )
+        names = [t.name for t in pipeline]
+        self.assertIn("therock/shard-pin", names)
+        # pin sits after the import and before the first build subproject task.
+        pin_i = names.index("therock/shard-pin")
+        self.assertLess(names.index(f"therock/import-{import_group}"), pin_i)
+        sub_group = backend._subproject_group_map(topo)
+        build_comps = [c for c, gs in sub_group.items() if build_group in gs]
+        first_build = min(
+            i for i, t in enumerate(pipeline) if t.comp in build_comps
+        )
+        self.assertLess(pin_i, first_build)
+        # The pin task is a buildctl enable scoped to the build comps' stages.
+        pin = pipeline[pin_i]
+        self.assertEqual(pin.payload["argv"][1:3],
+                         [os.path.join(self.therock, "build_tools",
+                                       "buildctl.py"), "enable"])
 
 
 class TtyStream(io.StringIO):
