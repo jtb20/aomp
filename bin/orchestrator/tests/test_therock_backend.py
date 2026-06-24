@@ -442,11 +442,14 @@ class SourceConfigSwitchTest(unittest.TestCase):
                                side_effect=fake_run) as run, \
                 redirect_stdout(buf):
             backend.load_config(args)
-        # A reconfigure (restart) ran despite no --reconfigure.
+        # A reconfigure (restart) ran despite no --reconfigure. A switch runs
+        # setup_srock.sh restart *twice*: once to switch the branch/sources
+        # (which reverts injected introspection), then again after re-injecting
+        # so the introspection survives and the map is produced.
         self.assertTrue(run.called)
-        self.assertTrue(
-            any("restart" in " ".join(c.args[0]) for c in run.call_args_list)
-        )
+        restarts = [c for c in run.call_args_list
+                    if c.args[0][:1] == ["bash"] and "restart" in " ".join(c.args[0])]
+        self.assertEqual(len(restarts), 2)
         self.assertIn("source config switch", buf.getvalue())
         # Marker now reflects the requested config.
         self.assertEqual(self._marker(), "amd-staging")
@@ -505,10 +508,10 @@ class SourceConfigSwitchTest(unittest.TestCase):
             backend.load_config(args)
         self.assertIn("source config switch", buf.getvalue())
         self.assertIn("branch main", buf.getvalue())
-        self.assertTrue(
-            any(c.args[0][:1] == ["bash"] and "restart" in " ".join(c.args[0])
-                for c in run.call_args_list)
-        )
+        # Two restarts: the branch switch, then the post-injection reconfigure.
+        restarts = [c for c in run.call_args_list
+                    if c.args[0][:1] == ["bash"] and "restart" in " ".join(c.args[0])]
+        self.assertEqual(len(restarts), 2)
         # Marker is written to reflect the now-current config.
         self.assertEqual(self._marker(), "amd-staging")
 

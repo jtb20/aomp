@@ -848,9 +848,15 @@ class TheRockBackend(Backend):
                 f"{extra} -DTHEROCK_INTROSPECTION=ON".strip()
             )
 
-        # First use: clone + fetch sources (a full setup). Stock TheRock has no
-        # introspection support yet, so this initial configure won't emit the
-        # map -- that's fine; we inject support and reconfigure below.
+        # Lay down the correct sources *before* injecting introspection, because
+        # both source-laying steps revert the tracked files we inject into
+        # (CMakeLists.txt + cmake/therock_artifacts.cmake):
+        #   * First use: clone + fetch sources (a full setup).
+        #   * A source-config switch on an existing checkout: setup_srock.sh
+        #     restart performs `git checkout` of the new branch, reverting any
+        #     previously injected introspection and resyncing submodules.
+        # Their configure lacks introspection (stock TheRock has none), so it
+        # won't emit the map -- that's fine; we inject and reconfigure below.
         if not os.path.isdir(therock_dir):
             print(
                 f"{core.PROG}: setting up TheRock (clone + fetch sources): "
@@ -859,8 +865,19 @@ class TheRockBackend(Backend):
             rc = subprocess.run(["bash", SETUP_SROCK], env=run_env).returncode
             if rc != 0:
                 core._fail(f"TheRock setup failed (rc={rc})")
+        elif switch_needed:
+            print(
+                f"{core.PROG}: switching TheRock sources to '{desired_cfg}': "
+                f"{SETUP_SROCK} restart", flush=True,
+            )
+            rc = subprocess.run(
+                ["bash", SETUP_SROCK, "restart"], env=run_env
+            ).returncode
+            if rc != 0:
+                core._fail(f"TheRock source switch failed (rc={rc})")
 
-        # Ensure PR #1234's introspection support is present in the checkout.
+        # Ensure PR #1234's introspection support is present in the checkout
+        # (re-applied here after any source switch above reverted it).
         self._inject_introspection(therock_dir)
 
         # Reconfigure (reusing fetched sources) now that introspection is wired
