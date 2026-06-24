@@ -954,6 +954,8 @@ def build_arg_parser(
             "  list-shards   print the backend's shard catalog and exit\n"
             "                  (TheRock: BUILD_TOPOLOGY.toml artifact groups;\n"
             "                  drive one with --import/build/export-shard)\n"
+            "  list-configs  print the backend's source configs and exit\n"
+            "                  (TheRock: which branches -c/--config selects)\n"
             "  N             run task number N (1-based)\n"
             "  N--M          run the inclusive range of tasks N..M\n"
             "  comp/variant/stage  glob/substring match (supports {a,b} braces);\n"
@@ -971,7 +973,10 @@ def build_arg_parser(
     )
     parser.add_argument("selectors", nargs="*", help="task selector(s); see below")
     parser.add_argument("-c", "--config", default=default_config,
-                        help=f"CUDF config file (default: {default_config})")
+                        help="config selector: a CUDF config file (AOMP "
+                             "backend) or a source-config name (TheRock backend; "
+                             "see `list-configs`). "
+                             f"Default: {default_config}")
     # Core directory layout (exported to child build scripts).
     parser.add_argument("-s", "--source", default=None, metavar="DIR",
                         help="source/repo root (AOMP_REPOS) holding the cloned "
@@ -1217,6 +1222,33 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
     preconfig_rc = backend.provision_preconfig(args)
     if preconfig_rc is not None:
         return preconfig_rc
+
+    # `list-configs` selector: print the backend's source-config catalog (which
+    # sources -c/--config can select) and exit. Static (reads the config files),
+    # so it runs before load_config -- no checkout or configure required.
+    if args.selectors and args.selectors[0] == "list-configs":
+        rows = backend.list_source_configs()
+        if rows is None:
+            print(f"{PROG}: this backend has no source-config concept")
+            return 0
+        if not rows:
+            print(f"{PROG}: no source configs found")
+            return 0
+        width = max(len(r["name"]) for r in rows)
+        for r in rows:
+            tag = " (default)" if r.get("default") else ""
+            line = f"{r['name']:<{width}}{tag}"
+            branches = []
+            if r.get("therock_branch"):
+                branches.append(f"therock={r['therock_branch']}")
+            if r.get("compiler_branch"):
+                branches.append(f"compiler={r['compiler_branch']}")
+            if branches:
+                line += f"  [{', '.join(branches)}]"
+            if r.get("description"):
+                line += f"  - {r['description']}"
+            print(line)
+        return 0
 
     cfg = backend.load_config(args)
     config_name = backend.config_name(args)

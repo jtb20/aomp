@@ -18,6 +18,12 @@ thisdir=$(dirname "$realpath")
 ARG=$1
 export _build_srock_mode="$ARG"
 
+# Set to 1 below when an existing checkout's super-repo branch differs from the
+# requested SROCK_THEROCK_BRANCH (a source-config switch, e.g. amd-staging <->
+# develop). A switch makes the "restart" path also resync sources and re-apply
+# the compiler override, so the in-place checkout matches the requested config.
+_do_branch_switch=0
+
 if [ -d "$SROCK_THEROCK_DIR" ] && [ "$ARG" != "restart" ]; then
    echo " ERROR:  $0 requires that $SROCK_THEROCK_DIR NOT exist"
    echo "         Delete or move that directory to run $0"
@@ -66,7 +72,33 @@ cd "$SROCK_THEROCK_DIR" || exit
 
 srock_venv_activate
 
-if [ "$ARG" != "restart" ]; then
+# In-place source-config switch: on "restart" against an existing checkout whose
+# super-repo branch differs from the requested SROCK_THEROCK_BRANCH, switch the
+# super-repo branch here. fetch_sources.py and the compiler-submodule override
+# below are then forced to run (despite "restart") so submodules are repinned to
+# the new branch's recorded SHAs and the matching patch set is reapplied. Without
+# this, "restart" reuses whatever branch was first cloned.
+if [ "$ARG" = "restart" ]; then
+   _current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+   if [ -n "$SROCK_THEROCK_BRANCH" ] && [ -n "$_current_branch" ] && \
+      [ "$_current_branch" != "$SROCK_THEROCK_BRANCH" ]; then
+      _do_branch_switch=1
+      echo
+      echo "===== Source config switch: super-repo branch $_current_branch -> $SROCK_THEROCK_BRANCH"
+      echo "      --- discarding local changes in submodules so they can be repinned"
+      git submodule foreach --recursive 'git checkout . 2>/dev/null || true'
+      echo "      --- git checkout . (super-repo)"
+      git checkout .
+      echo "      --- git fetch origin $SROCK_THEROCK_BRANCH"
+      git fetch origin "$SROCK_THEROCK_BRANCH"
+      echo "      --- git checkout $SROCK_THEROCK_BRANCH"
+      git checkout "$SROCK_THEROCK_BRANCH"
+      echo "      --- git pull (most recent $SROCK_THEROCK_BRANCH)"
+      git pull
+   fi
+fi
+
+if [ "$ARG" != "restart" ] || [ "$_do_branch_switch" = 1 ]; then
    echo
    echo "===== Running python ./build_tools/fetch_sources.py ====="
    python ./build_tools/fetch_sources.py
@@ -87,8 +119,13 @@ echo
 echo "===== Running build_tools/setup_ccache.py"
 eval "$(python3 ./build_tools/setup_ccache.py)"
 
-# Make updates to compiler submodules unless this is native TheRock build 
-if [ "$SROCK_COMPILER_BRANCH" != "develop" ] && [ "$ARG" != "restart" ]; then
+# Make updates to compiler submodules unless this is native TheRock build.
+# Runs on a fresh setup, and on "restart" only when switching source config
+# (above) -- so a config switch into amd-staging re-applies the override/patches,
+# while a config switch into develop (SROCK_COMPILER_BRANCH=develop) skips it,
+# leaving the native sources fetch_sources.py just repinned.
+if [ "$SROCK_COMPILER_BRANCH" != "develop" ] && \
+   { [ "$ARG" != "restart" ] || [ "$_do_branch_switch" = 1 ]; }; then
    # FIXME: Before wiping out current amd-staging changes, 
    #        to save current changes in the patches directory. 
    #        Otherwise, this is not a real development environment"

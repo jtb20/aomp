@@ -27,7 +27,7 @@ import re
 import shutil
 import subprocess
 
-from . import core, source_layout, topology
+from . import core, source_config, source_layout, topology
 from .backend import Backend
 from .model import Config, Package, RawTask, Task
 
@@ -90,6 +90,14 @@ _SPECIAL_TOGGLES = frozenset({"all", "all-debug", "sysdeps"})
 
 # Default config name (mirrors srock_common_vars SROCK_CONFIG default).
 DEFAULT_CONFIG = "minimal"
+
+# Marker file in the TheRock checkout recording the *source config* its sources
+# are currently checked out for (see source_config.py). The shared checkout is
+# switched in place between configs; a mismatch between this marker and the
+# requested config means the sources must be switched (branch checkout + submodule
+# resync) on the next reconfigure (see _ensure_subproject_map). Absent on a legacy
+# checkout predating source configs (treated as "unknown", no forced switch).
+SOURCE_CONFIG_MARKER = ".srock-source-config"
 
 # Forward build pipeline, in execution order. Deliberately excluded:
 #   * "dist"    -- in TheRock, a subproject's "+dist" target is wired into
@@ -223,16 +231,36 @@ def _srock_config(args: argparse.Namespace) -> str:
 
 
 def _explicit_config(args: argparse.Namespace) -> str | None:
-    """A config *name* the user passed via -c/--config, or None.
+    """A *source config* name the user passed via -c/--config, or None.
 
-    -c/--config is unsupported for TheRock builds (the build set is chosen with
-    --add). The aomp_build entry defaults --config to a .cudf *path* and the
-    therock_build entry defaults it to None; empty/path/.cudf values are the
-    inherited defaults, not an explicit srock config name, so they return None."""
+    For TheRock, -c/--config selects a *source config* (which TheRock branches to
+    build, see source_config.py) -- not the build *scope* (minimal/all/all-debug),
+    which is chosen with --add. The aomp_build entry defaults --config to a .cudf
+    *path* and the therock_build entry defaults it to None; empty/path/.cudf
+    values are the inherited defaults, not an explicit source config name, so they
+    return None (falling back to the default source config)."""
     config = getattr(args, "config", None)
     if not config or os.sep in config or config.endswith(".cudf"):
         return None
     return config
+
+
+def _resolve_source_config(args: argparse.Namespace) -> source_config.SourceConfig:
+    """The TheRock source config to build (default amd-staging).
+
+    Resolves the -c/--config name to a SourceConfig. An unknown name warns and
+    falls back to the default (so a typo never silently builds the wrong branch
+    without notice, but also never hard-fails a build). The build scope (--add)
+    is orthogonal and unaffected."""
+    name = _explicit_config(args) or source_config.DEFAULT_SOURCE_CONFIG
+    try:
+        return source_config.load(name)
+    except source_config.SourceConfigError as exc:
+        core._warn(
+            f"{exc}; falling back to default source config "
+            f"'{source_config.DEFAULT_SOURCE_CONFIG}'."
+        )
+        return source_config.load(source_config.DEFAULT_SOURCE_CONFIG)
 
 
 class TheRockBackend(Backend):
@@ -390,7 +418,22 @@ class TheRockBackend(Backend):
                 )
 
     def config_name(self, args: argparse.Namespace) -> str:
-        return _srock_config(args)
+        # Combine source config and build scope so distinct source selections
+        # (e.g. amd-staging vs develop) get distinct export manifests and never
+        # collide, mirroring how they occupy distinct CMake configurations.
+        return f"{_resolve_source_config(args).name}-{_srock_config(args)}"
+
+    def list_source_configs(self) -> list[dict] | None:
+        rows: list[dict] = []
+        for cfg in source_config.catalog():
+            rows.append({
+                "name": cfg.name,
+                "description": cfg.description,
+                "therock_branch": cfg.therock_branch,
+                "compiler_branch": cfg.compiler_branch,
+                "default": cfg.name == source_config.DEFAULT_SOURCE_CONFIG,
+            })
+        return rows
 
     # --- feature selection (THEROCK_ENABLE_*) ----------------------------- #
     def _read_feature_map(self, path: str) -> dict[str, dict]:
@@ -539,16 +582,20 @@ class TheRockBackend(Backend):
         therock_dir = getattr(args, "therock_dir", None)
         setdir("SROCK_THEROCK_DIR", therock_dir)
 
-        # SROCK_CONFIG comes from --add (all / all-debug; minimal default).
-        # -c/--config is unsupported for TheRock; warn and ignore if given.
-        explicit = _explicit_config(args)
-        if explicit:
-            core._warn(
-                f"-c/--config '{explicit}' is not supported for TheRock builds "
-                "and is ignored; select the build set with --add instead "
-                "(--add all | --add all-debug; minimal is the default)."
-            )
+        # SROCK_CONFIG (build scope) comes from --add (all / all-debug; minimal
+        # default). Orthogonal to the *source config* below.
         env["SROCK_CONFIG"] = _srock_config(args)
+
+        # -c/--config selects the *source config*: which TheRock branches the
+        # srock scripts check out. Translate it to the srock branch env vars so
+        # setup_srock.sh clones/switches the right sources (and applies the
+        # matching compiler override + patch set). Branches only -- submodule
+        # SHAs always come from whatever those branches record (see
+        # source_config.py). These are deliberately not in ENV_PASSTHROUGH, so
+        # the config (not a stray parent export) is authoritative.
+        srcfg = _resolve_source_config(args)
+        env["SROCK_THEROCK_BRANCH"] = srcfg.therock_branch
+        env["SROCK_COMPILER_BRANCH"] = srcfg.compiler_branch
         if args.gfx:
             env["GFXLIST"] = args.gfx
         if args.jobs is not None:
@@ -747,6 +794,37 @@ class TheRockBackend(Backend):
         json_path = os.path.join(build_dir, SUBPROJECT_MAP)
         reconfigure = bool(getattr(self._args, "reconfigure", False))
 
+        # Detect a source-config switch: the shared checkout is reused across
+        # source configs, so if it does not already reflect the requested config
+        # the sources must be switched (branch checkout + submodule resync, done
+        # by setup_srock.sh) and the tree reconfigured. Force a reconfigure for
+        # the switch even if the caller did not ask for one (otherwise we'd build
+        # the previous config's sources against the new config's name).
+        #
+        # The marker records the full config identity (it also captures the
+        # compiler-submodule branch, which the super-repo branch does not). When
+        # it is absent -- a checkout set up directly by setup_srock.sh or
+        # predating source configs -- fall back to the *actual* checked-out
+        # super-repo branch so `-c <name>` still takes effect on existing trees.
+        therock_dir = info["SROCK_THEROCK_DIR"]
+        srcfg = _resolve_source_config(self._args)
+        desired_cfg = srcfg.name
+        current_cfg = self._read_source_marker(therock_dir)
+        if current_cfg is not None:
+            switch_needed = current_cfg != desired_cfg
+            from_label = current_cfg
+        else:
+            branch = self._checked_out_branch(therock_dir)
+            switch_needed = branch is not None and branch != srcfg.therock_branch
+            from_label = f"branch {branch}" if branch else "unknown"
+        if switch_needed and not reconfigure:
+            print(
+                f"{core.PROG}: source config switch "
+                f"({from_label}) -> '{desired_cfg}' requires reconfigure; "
+                f"forcing it.", flush=True,
+            )
+            reconfigure = True
+
         if os.path.isfile(json_path) and not reconfigure:
             return json_path
         if not reconfigure:
@@ -763,7 +841,6 @@ class TheRockBackend(Backend):
         if not os.path.isfile(SETUP_SROCK):
             core._fail(f"cannot --reconfigure: missing {SETUP_SROCK}")
 
-        therock_dir = info["SROCK_THEROCK_DIR"]
         run_env = dict(env)
         extra = run_env.get("SROCK_CMAKE_EXTRA", "")
         if "THEROCK_INTROSPECTION" not in extra:
@@ -802,7 +879,59 @@ class TheRockBackend(Backend):
                 f"configure did not produce {json_path}; introspection injection "
                 f"may have failed (see {therock_dir}/CMakeLists.txt)."
             )
+        # Record the source config the checkout now reflects, so a later run with
+        # a different --config detects the switch (see top of this method).
+        self._write_source_marker(therock_dir, desired_cfg)
         return json_path
+
+    def _checked_out_branch(self, therock_dir: str) -> str | None:
+        """The super-repo's current branch name, or None.
+
+        Used as the marker-less fallback for switch detection. Returns None when
+        there is no git checkout, on any git error, or for a detached HEAD
+        (``rev-parse`` yields the literal "HEAD") -- in which case we cannot tell
+        the source config from the branch and conservatively force no switch
+        (use --reconfigure to switch explicitly)."""
+        if not os.path.isdir(os.path.join(therock_dir, ".git")):
+            return None
+        try:
+            proc = subprocess.run(
+                ["git", "-C", therock_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True,
+            )
+        except OSError:
+            return None
+        if proc.returncode != 0:
+            return None
+        branch = proc.stdout.strip()
+        if not branch or branch == "HEAD":
+            return None
+        return branch
+
+    def _read_source_marker(self, therock_dir: str) -> str | None:
+        """The source config name the checkout records, or None if unknown.
+
+        None means either no checkout yet or a legacy checkout predating source
+        configs (a missing marker); in both cases no switch is forced."""
+        try:
+            with open(
+                os.path.join(therock_dir, SOURCE_CONFIG_MARKER), encoding="utf-8"
+            ) as handle:
+                name = handle.read().strip()
+        except OSError:
+            return None
+        return name or None
+
+    def _write_source_marker(self, therock_dir: str, name: str) -> None:
+        """Record ``name`` as the checkout's active source config (best effort)."""
+        try:
+            with open(
+                os.path.join(therock_dir, SOURCE_CONFIG_MARKER),
+                "w", encoding="utf-8",
+            ) as handle:
+                handle.write(f"{name}\n")
+        except OSError as exc:
+            core._warn(f"could not write source config marker: {exc}")
 
     def _inject_introspection(self, therock_dir: str) -> None:
         """Make a stock TheRock checkout introspectable (PR #1234).

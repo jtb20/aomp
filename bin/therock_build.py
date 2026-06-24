@@ -28,9 +28,12 @@ def main(argv: list[str]) -> int:
     parser = core.build_arg_parser(
         "therock_build.py", None,
         description="Introspectable orchestrator for TheRock's CMake super-build "
-                    "(srock). The build set is selected with --add "
+                    "(srock). The build *scope* is selected with --add "
                     "(--add all | --add all-debug; minimal is the default; add "
-                    "sysdeps to bundle system deps). -c/--config is unsupported.",
+                    "sysdeps to bundle system deps). The *source config* (which "
+                    "TheRock branches to build) is selected with -c/--config "
+                    "(amd-staging default; develop for native upstream; see "
+                    "`list-configs`).",
         inherit_path_note=DEFAULT_CHILD_PATH,
     )
     core.add_backend_options(parser, default_backend="therock")
