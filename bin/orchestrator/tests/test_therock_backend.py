@@ -775,6 +775,14 @@ class FeatureSelectionTest(unittest.TestCase):
             "enabled": True, "description": "Enable building of the compiler",
             "feature": True, "requires": [],
         },
+        "AMD_DBGAPI": {
+            "enabled": True, "description": "Enable amd-dbgapi",
+            "feature": True, "requires": [],
+        },
+        "ROCGDB": {
+            "enabled": True, "description": "Enable rocgdb",
+            "feature": True, "requires": ["AMD_DBGAPI"],
+        },
     }
 
     def setUp(self) -> None:
@@ -833,6 +841,64 @@ class FeatureSelectionTest(unittest.TestCase):
         self.assertIn("compiler", cfg.features)
         self.assertIn("ml-libs", cfg.features)
         core.resolve_components(cfg, ["hipdnn", "ml-libs"], [])
+
+    def test_remove_feature_with_reconfigure_appends_off_flag(self) -> None:
+        # Removing rocgdb (no dependents) disables only ROCGDB.
+        backend, args, env, info = self._backend_env(
+            "--remove", "rocgdb", "--reconfigure", "list",
+        )
+        backend._apply_feature_flags(env, info, args)
+        self.assertIn("-DTHEROCK_ENABLE_ROCGDB=OFF", env["SROCK_CMAKE_EXTRA"])
+        self.assertNotIn(
+            "-DTHEROCK_ENABLE_AMD_DBGAPI=OFF", env["SROCK_CMAKE_EXTRA"]
+        )
+
+    def test_remove_feature_cascades_to_dependents(self) -> None:
+        # Removing amd-dbgapi also disables ROCGDB, which requires it.
+        backend, args, env, info = self._backend_env(
+            "--remove", "amd-dbgapi", "--reconfigure", "list",
+        )
+        backend._apply_feature_flags(env, info, args)
+        self.assertIn(
+            "-DTHEROCK_ENABLE_AMD_DBGAPI=OFF", env["SROCK_CMAKE_EXTRA"]
+        )
+        self.assertIn("-DTHEROCK_ENABLE_ROCGDB=OFF", env["SROCK_CMAKE_EXTRA"])
+
+    def test_remove_enabled_feature_without_reconfigure_fails(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(
+            self.therock, self.repos, "--remove", "amd-dbgapi", "list"
+        )
+        with self.assertRaises(SystemExit):
+            backend.load_config(args)
+
+    def test_add_and_remove_same_feature_conflicts(self) -> None:
+        backend, args, env, info = self._backend_env(
+            "--add", "rocgdb", "--remove", "rocgdb", "--reconfigure", "list",
+        )
+        with self.assertRaises(SystemExit):
+            backend._apply_feature_flags(env, info, args)
+
+    def test_remove_already_disabled_feature_is_noop(self) -> None:
+        # hipdnn is not enabled, so removing it changes nothing and needs no
+        # reconfigure.
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "--remove", "hipdnn", "list")
+        backend.load_config(args)
+        self.assertNotIn(
+            "-DTHEROCK_ENABLE_HIPDNN=OFF",
+            backend.build_child_env(args).get("SROCK_CMAKE_EXTRA", ""),
+        )
+
+    def test_remove_unknown_feature_is_noop(self) -> None:
+        backend, args, env, info = self._backend_env(
+            "--remove", "does-not-exist", "--reconfigure", "list",
+        )
+        backend._apply_feature_flags(env, info, args)
+        self.assertNotIn(
+            "-DTHEROCK_ENABLE_DOES_NOT_EXIST=OFF",
+            env.get("SROCK_CMAKE_EXTRA", ""),
+        )
 
     def test_list_features_rows(self) -> None:
         backend = TheRockBackend()
