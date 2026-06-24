@@ -190,6 +190,25 @@ if [ "$SROCK_COMPILER_BRANCH" != "develop" ] && \
       rm "$_tmpfile"
    fi
 
+   # Reconstruct compiler/.amd-llvm.smrev from the current HEAD before the cmake
+   # configure below. TheRock's compiler/CMakeLists.txt reads this file at
+   # configure time and forces it as the compiler's VC revision (clang
+   # --version). srock's fetch_sources.py run (no --patch-tag) removes the file,
+   # and the amd-staging checkout + patches leave amd-llvm non-pristine/dirty, so
+   # without this LLVM would auto-compute a less precise (possibly "-dirty")
+   # revision. Doing it here (vs build_srock.sh, which ran it after configure)
+   # means both the orchestrator and the two-script srock workflow get a clean,
+   # deterministic revision. Skipped for native develop builds (handled by the
+   # enclosing SROCK_COMPILER_BRANCH != develop guard).
+   echo "      --- reconstructing compiler/.amd-llvm.smrev from current HEAD"
+   (
+      cd "$SROCK_THEROCK_DIR/compiler/amd-llvm" || exit
+      _smrev="../.amd-llvm.smrev"
+      git config --get remote.origin.url > "$_smrev"
+      _smsha=$(git rev-parse HEAD)
+      echo "${_smsha}${LLVM_SHA_EXTRA}" >> "$_smrev"
+   )
+
 echo "      --- end compiler submodule updates for $SROCK_COMPILER_BRANCH"
 fi
 

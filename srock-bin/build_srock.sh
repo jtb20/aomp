@@ -49,15 +49,10 @@ echo "===== Sourcing prebuild_srock.sh"
 . "$thisdir/prebuild_srock.sh"
 echo "===== DONE Sourcing prebuild_srock.sh"
 
-(
-cd "$SROCK_THEROCK_DIR" || exit
-# reconstruct .amd-llvm.smrev using the current SHA
-cd compiler/amd-llvm || exit
-smrev="../.amd-llvm.smrev"
-git config --get remote.origin.url > "$smrev"
-smsha=$(git rev-parse HEAD)
-echo "${smsha}${LLVM_SHA_EXTRA}" >> "$smrev"
-)
+# Note: compiler/.amd-llvm.smrev (the forced LLVM VC revision) is now
+# reconstructed in setup_srock.sh, before the cmake configure that consumes it,
+# so both this workflow and the orchestrator get a clean, deterministic
+# revision. (It previously lived here, but ran after setup's configure.)
 
 cd "$SROCK_THEROCK_DIR" || exit
 _cmd="$SROCK_CMAKE --build build"
