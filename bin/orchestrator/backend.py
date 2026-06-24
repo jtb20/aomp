@@ -103,6 +103,17 @@ class Backend(ABC):
         """The -C/--clean pseudo-task (wipe install dir), or None if unsupported."""
         return None
 
+    def list_source_configs(self) -> list[dict] | None:
+        """Rows for the `list-configs` selector, or None if the backend has no
+        source-config concept.
+
+        A *source config* selects which sources a build uses (for TheRock, the
+        git branches the srock scripts check out), chosen with -c/--config. Each
+        row is a dict with at least 'name'; the TheRock backend also reports
+        'description', 'therock_branch', 'compiler_branch', and 'default' (the
+        config used when -c/--config is omitted). Default: None."""
+        return None
+
     def list_features(self, env: dict[str, str]) -> list[dict] | None:
         """Rows for the `list-features` selector, or None if the backend has no
         feature concept. Each row is a dict with at least 'name' and 'enabled';

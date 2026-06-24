@@ -1,0 +1,10 @@
+# amd-staging source config (default).
+#
+# The historical srock default: TheRock's compiler/amd-staging super-repo branch
+# with compiler submodules switched to amd-staging and the matching srock patch
+# set applied. A source config names branches only; the submodule SHAs come from
+# whatever those branches currently record, so no manual pin updates are needed.
+description = "AMD staging compiler (srock default): compiler/amd-staging + amd-staging compiler submodules + patches"
+therock_branch = "compiler/amd-staging"
+compiler_branch = "amd-staging"
+# patch_tag defaults to compiler_branch (srock-bin/patches/amd-staging).

@@ -26,7 +26,7 @@ BIN_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file
 if BIN_DIR not in sys.path:
     sys.path.insert(0, BIN_DIR)
 
-from orchestrator import core, shard_artifacts, topology  # noqa: E402
+from orchestrator import core, shard_artifacts, therock_backend, topology  # noqa: E402
 from orchestrator.model import Task  # noqa: E402
 from orchestrator.therock_backend import (  # noqa: E402
     DEFAULT_CHILD_PATH, DEFAULT_CONFIG, TheRockBackend,
@@ -299,15 +299,68 @@ class TheRockFixtureTest(unittest.TestCase):
         core.resolve_components(cfg, ["all"], [])
         core.resolve_components(cfg, ["all-debug"], [])
 
-    def test_explicit_config_warns_and_is_ignored(self) -> None:
+    def test_default_source_config_sets_amd_staging_branches(self) -> None:
+        # No -c/--config: the default source config (amd-staging) drives the
+        # srock branch env vars, matching the historical srock_common_vars
+        # defaults. Build scope is independent (minimal here).
+        env = TheRockBackend().build_child_env(
+            make_args(self.therock, self.repos, "list")
+        )
+        self.assertEqual(env["SROCK_THEROCK_BRANCH"], "compiler/amd-staging")
+        self.assertEqual(env["SROCK_COMPILER_BRANCH"], "amd-staging")
+        self.assertEqual(env["SROCK_CONFIG"], DEFAULT_CONFIG)  # "minimal"
+
+    def test_develop_source_config_sets_native_branches(self) -> None:
+        # -c develop selects native upstream TheRock: main super-repo branch and
+        # the develop sentinel (so setup_srock.sh skips the compiler override).
+        env = TheRockBackend().build_child_env(
+            make_args(self.therock, self.repos, "-c", "develop", "list")
+        )
+        self.assertEqual(env["SROCK_THEROCK_BRANCH"], "main")
+        self.assertEqual(env["SROCK_COMPILER_BRANCH"], "develop")
+
+    def test_source_config_is_independent_of_build_scope(self) -> None:
+        # --add all (scope) does not change the source config branches; -c
+        # develop (source) does not change SROCK_CONFIG.
+        env = TheRockBackend().build_child_env(
+            make_args(self.therock, self.repos,
+                      "-c", "develop", "--add", "all", "list")
+        )
+        self.assertEqual(env["SROCK_CONFIG"], "all")
+        self.assertEqual(env["SROCK_THEROCK_BRANCH"], "main")
+        self.assertEqual(env["SROCK_COMPILER_BRANCH"], "develop")
+
+    def test_unknown_source_config_warns_and_falls_back(self) -> None:
         buf = io.StringIO()
         with redirect_stderr(buf):
             env = TheRockBackend().build_child_env(
-                make_args(self.therock, self.repos, "-c", "all", "list")
+                make_args(self.therock, self.repos, "-c", "bogus", "list")
             )
-        self.assertIn("not supported", buf.getvalue())
-        # -c is ignored; with no --add toggle the config falls back to minimal.
-        self.assertEqual(env["SROCK_CONFIG"], DEFAULT_CONFIG)
+        self.assertIn("unknown source config", buf.getvalue())
+        # Falls back to the default (amd-staging) branches.
+        self.assertEqual(env["SROCK_THEROCK_BRANCH"], "compiler/amd-staging")
+        self.assertEqual(env["SROCK_COMPILER_BRANCH"], "amd-staging")
+
+    def test_config_name_folds_source_config_and_scope(self) -> None:
+        backend = TheRockBackend()
+        self.assertEqual(
+            backend.config_name(make_args(self.therock, self.repos, "list")),
+            f"amd-staging-{DEFAULT_CONFIG}",
+        )
+        self.assertEqual(
+            backend.config_name(make_args(
+                self.therock, self.repos, "-c", "develop", "--add", "all", "list")),
+            "develop-all",
+        )
+
+    def test_list_source_configs_reports_catalog(self) -> None:
+        rows = TheRockBackend().list_source_configs()
+        by_name = {r["name"]: r for r in rows}
+        self.assertIn("amd-staging", by_name)
+        self.assertIn("develop", by_name)
+        self.assertTrue(by_name["amd-staging"]["default"])
+        self.assertFalse(by_name["develop"]["default"])
+        self.assertEqual(by_name["develop"]["therock_branch"], "main")
 
     def test_stage_relpath_maps_build_to_stage(self) -> None:
         backend, _, _ = self._load()
@@ -316,6 +369,168 @@ class TheRockFixtureTest(unittest.TestCase):
         )
         self.assertEqual(
             backend._stage_relpath("hipBLAS"), "math-libs/BLAS/hipBLAS/stage"
+        )
+
+
+class SourceConfigSwitchTest(unittest.TestCase):
+    """The shared checkout's source-config marker drives in-place switching.
+
+    A configured checkout (subproject_map.json present) is normally reused as-is
+    without --reconfigure. But if its recorded source config differs from the
+    requested one, load_config must force a reconfigure (driving the branch
+    switch in setup_srock.sh) and rewrite the marker."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-switch-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        # Minimal checkout shape so _inject_introspection's preconditions pass.
+        os.makedirs(os.path.join(self.therock, "cmake"))
+        os.makedirs(self.build)
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "w") as fh:
+            fh.write("# fixture\n")
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+        self.marker = os.path.join(self.therock, ".srock-source-config")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _marker(self) -> str | None:
+        try:
+            with open(self.marker) as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+
+    def _prime(self, backend: TheRockBackend, args) -> None:
+        # discover_env shells out to source srock_common_vars; run that once now
+        # (real) so its result is cached and a later subprocess.run mock only
+        # sees the reconfigure call (not the env discovery).
+        backend.discover_env(backend.build_child_env(args))
+
+    def test_matching_marker_reuses_without_reconfigure(self) -> None:
+        # Marker matches the (default) requested config -> no switch, the
+        # existing map is reused and no configure subprocess runs.
+        with open(self.marker, "w") as fh:
+            fh.write("amd-staging\n")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        self._prime(backend, args)
+        from unittest import mock
+        with mock.patch.object(therock_backend.subprocess, "run") as run:
+            backend.load_config(args)
+        run.assert_not_called()
+
+    def test_mismatched_marker_forces_reconfigure_and_rewrites(self) -> None:
+        # Marker says develop, but the default request is amd-staging -> a switch
+        # is detected, a reconfigure is forced (setup_srock.sh restart), and the
+        # marker is rewritten to the new config.
+        with open(self.marker, "w") as fh:
+            fh.write("develop\n")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        self._prime(backend, args)
+        from unittest import mock
+
+        def fake_run(cmd, *a, **kw):
+            return mock.Mock(returncode=0)
+
+        buf = io.StringIO()
+        with mock.patch.object(therock_backend.subprocess, "run",
+                               side_effect=fake_run) as run, \
+                redirect_stdout(buf):
+            backend.load_config(args)
+        # A reconfigure (restart) ran despite no --reconfigure.
+        self.assertTrue(run.called)
+        self.assertTrue(
+            any("restart" in " ".join(c.args[0]) for c in run.call_args_list)
+        )
+        self.assertIn("source config switch", buf.getvalue())
+        # Marker now reflects the requested config.
+        self.assertEqual(self._marker(), "amd-staging")
+
+    def test_missing_marker_and_no_git_does_not_force_switch(self) -> None:
+        # A marker-less checkout that is also not a git repo: nothing to compare
+        # against, so it is reused as-is; no forced reconfigure.
+        self.assertIsNone(self._marker())
+        self.assertFalse(os.path.isdir(os.path.join(self.therock, ".git")))
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        self._prime(backend, args)
+        from unittest import mock
+        with mock.patch.object(therock_backend.subprocess, "run") as run:
+            backend.load_config(args)
+        run.assert_not_called()
+
+    def _git_init(self, branch: str) -> None:
+        import subprocess as sp
+        sp.run(["git", "init", "-q", self.therock], check=True)
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        sp.run(["git", "-C", self.therock, "commit", "--allow-empty", "-q",
+                "-m", "x"], check=True, env=env)
+        sp.run(["git", "-C", self.therock, "branch", "-m", branch], check=True)
+
+    def test_checked_out_branch_reads_git(self) -> None:
+        self._git_init("compiler/amd-staging")
+        backend = TheRockBackend()
+        self.assertEqual(
+            backend._checked_out_branch(self.therock), "compiler/amd-staging"
+        )
+
+    def test_marker_less_switch_falls_back_to_git_branch(self) -> None:
+        # No marker, but the checkout is on `main` (develop's branch); the
+        # default request (amd-staging -> compiler/amd-staging) differs, so the
+        # actual git branch drives the switch and forces a reconfigure.
+        self._git_init("main")
+        self.assertIsNone(self._marker())
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        self._prime(backend, args)
+        from unittest import mock
+        real_run = therock_backend.subprocess.run
+
+        def dispatch(cmd, *a, **kw):
+            # Let real git queries through; mock the heavy reconfigure (bash).
+            if cmd[:1] == ["git"]:
+                return real_run(cmd, *a, **kw)
+            return mock.Mock(returncode=0)
+
+        buf = io.StringIO()
+        with mock.patch.object(therock_backend.subprocess, "run",
+                               side_effect=dispatch) as run, \
+                redirect_stdout(buf):
+            backend.load_config(args)
+        self.assertIn("source config switch", buf.getvalue())
+        self.assertIn("branch main", buf.getvalue())
+        self.assertTrue(
+            any(c.args[0][:1] == ["bash"] and "restart" in " ".join(c.args[0])
+                for c in run.call_args_list)
+        )
+        # Marker is written to reflect the now-current config.
+        self.assertEqual(self._marker(), "amd-staging")
+
+    def test_marker_less_matching_git_branch_no_switch(self) -> None:
+        # No marker, checkout already on the default config's branch -> no switch.
+        self._git_init("compiler/amd-staging")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        self._prime(backend, args)
+        from unittest import mock
+        real_run = therock_backend.subprocess.run
+
+        def dispatch(cmd, *a, **kw):
+            if cmd[:1] == ["git"]:
+                return real_run(cmd, *a, **kw)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(therock_backend.subprocess, "run",
+                               side_effect=dispatch) as run:
+            backend.load_config(args)
+        self.assertFalse(
+            any(c.args[0][:1] == ["bash"] for c in run.call_args_list)
         )
 
 

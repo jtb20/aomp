@@ -120,6 +120,7 @@ aomp_build.py [options] [selector ...]
 | `list` (selector) | Print the numbered task list and exit (`[NNN] [✓] component/stage`; the tick marks completed tasks, see [Completion stamps](#completion-stamps)). Trailing selectors preview a focused build: `list amd-llvm` marks every other already-built component `[pinned]` (TheRock only, see [Incremental focus](#incremental-focus-auto-pin-out-of-scope-components)). |
 | `list-features` (selector) | Print the backend's configurable features and exit (TheRock only: the `THEROCK_ENABLE_*` flags, with ✓/✗ enabled state). Enable one with `--add <name> --reconfigure`. |
 | `list-shards` (selector) | Print the backend's shard catalog and exit (TheRock only: the `BUILD_TOPOLOGY.toml` artifact groups, with their subprojects, dependency groups, and artifact counts). Drive one with `--import-shard` / `--build-shard` / `--export-shard(s)`. See [Sharding](#sharding). |
+| `list-configs` (selector) | Print the backend's source configs and exit (TheRock only: the branches each `-c/--config` selects, with the default marked). See [Source config](#source-config-which-sources-to-build-via--c--config). |
 | `-a`, `--all` | (TheRock only) Elaborate *every* advertised per-subproject action (`expunge/configure/build/stage/dist`) instead of the default `configure/build/stage`. Use with `list` to see the full capability set, or with a selector to run a normally-hidden action (e.g. `-a amd-llvm/expunge`). See [TheRock backend](#therock-backend). |
 | `--components` | Print the resolved, dependency-ordered component list and exit. |
 | `-n`, `--dry-run` | Show what would run (command + log path per task) without executing. |
@@ -130,7 +131,7 @@ aomp_build.py [options] [selector ...]
 
 | Option | Description |
 |--------|-------------|
-| `-c`, `--config FILE` | CUDF config file. Default: `bin/configs/aomp.cudf`. |
+| `-c`, `--config` | **AOMP backend:** CUDF config file (default `bin/configs/aomp.cudf`). **TheRock backend:** source-config name selecting which TheRock branches to build (default `amd-staging`; see [Source config](#source-config-which-sources-to-build-via--c--config) and `list-configs`). |
 | `--add NAMES` | Add component(s) or feature(s). Comma-separated and/or repeatable. |
 | `--remove NAMES` | Remove component(s) or feature(s) (cascades to dependents). Comma-separated and/or repeatable. |
 | `--variant SPEC` | Variant filter: `cfg` (global) or `comp=cfg` (per-component). Comma-separated and/or repeatable. `default` is always built when offered (so `--variant debug` = default+debug); components offering neither are skipped (so `--variant default` skips the runtimes). See [Build variants](#build-variants). |
@@ -262,6 +263,7 @@ run. The grammar mirrors `amd-build`:
 | `list` | Print the numbered task list and exit (does not run anything). Trailing selectors preview a focused build, marking out-of-scope built components `[pinned]` (TheRock). |
 | `list-features` | Print the backend's configurable features and exit (TheRock: the `THEROCK_ENABLE_*` flags). Does not run anything. |
 | `list-shards` | Print the backend's shard catalog and exit (TheRock: the `BUILD_TOPOLOGY.toml` artifact groups). Does not run anything. |
+| `list-configs` | Print the backend's source configs and exit (TheRock: the branches each `-c/--config` selects). Does not run anything. |
 | `N` | Run task number `N` (1-based, as shown by `list`). |
 | `N--M` | Run the inclusive range of tasks `N` through `M`. |
 | `comp/variant/stage` | Glob/substring match on task names; supports `{a,b}` brace expansion. |
@@ -595,6 +597,8 @@ therock_build.py -n                   # dry-run the whole build
 therock_build.py 'amd-llvm/*'         # just the compiler's tasks
 therock_build.py list-shards          # list artifact groups (shards)
 therock_build.py --build-shard math-libs --import-shard compiler --export-shards
+therock_build.py list-configs         # list source configs (branch sets)
+therock_build.py -c develop --reconfigure   # build native upstream TheRock
 ```
 
 ### Where the build graph comes from
@@ -855,12 +859,50 @@ The build is controlled by the same `SROCK_*` conventions as the srock scripts:
 the supplemental tools dir (`-p` → `SROCK_SUPP`), and `GFXLIST` (`--gfx`).
 `--therock-dir` overrides the TheRock checkout location.
 
+#### Source config (which sources to build) via `-c/--config`
+
+For TheRock, `-c/--config` selects a **source config**: *which TheRock sources a
+build uses* — the git branches the srock scripts check out. This is orthogonal
+to the build *scope* (`SROCK_CONFIG`, below), which selects *how much* to build.
+The default is **`amd-staging`** (no option needed):
+
+| `-c/--config` | TheRock branch | Compiler submodules | Meaning |
+|---|---|---|---|
+| *(none)* / `amd-staging` | `compiler/amd-staging` | `amd-staging` + srock patches | AMD staging compiler (srock default) |
+| `develop` | `main` | native (no override/patches) | Native upstream TheRock |
+
+```
+therock_build.py list-configs                  # list source configs + branches
+./aomp_build.py --backend therock --reconfigure              # amd-staging (default)
+./aomp_build.py --backend therock -c develop --reconfigure   # native upstream
+```
+
+A source config names **branches only** — never a pinned SHA. TheRock records
+each branch's submodule pins as gitlink SHAs in that branch's own tree, and
+`fetch_sources.py` checks submodules out at exactly those recorded SHAs, so a
+config always tracks whatever the branch currently points at (no manual pin
+updates). Configs live in `srock-bin/source-configs/<name>.toml`; add a new one
+by dropping in a TOML file with `therock_branch` / `compiler_branch` (and an
+optional `description` / `patch_tag`).
+
+The TheRock checkout is **shared** across source configs and switched **in
+place**: a marker file (`<TheRock>/.srock-source-config`) records the config the
+sources currently reflect. Requesting a different `-c/--config` than the checkout
+currently reflects detects a switch and **forces a reconfigure** (no
+`--reconfigure` needed), driving `setup_srock.sh` to check out the new super-repo
+branch, resync submodules to its pins, and (for `amd-staging`) reapply the
+compiler override and patch set. When the marker is **absent** — a checkout set
+up directly by `setup_srock.sh` or predating this feature — the switch detection
+falls back to the checkout's **actual super-repo git branch**, so `-c <name>`
+still takes effect on existing trees (a detached HEAD is left untouched; use
+`--reconfigure` to switch it explicitly). The selected source config is also
+folded into the export manifest name (e.g. `amd-staging-minimal` vs
+`develop-minimal`) so distinct selections never collide.
+
 #### Build set (SROCK_CONFIG) via `--add`
 
-`-c/--config` is **not supported** for TheRock builds — passing it prints a
-warning and is ignored. The build set (`SROCK_CONFIG`) is instead a *configure
-toggle surfaced through `--add`*, with **`minimal`** as the default (no option
-needed):
+The build set (`SROCK_CONFIG`) is a *configure toggle surfaced through `--add`*,
+with **`minimal`** as the default (no option needed):
 
 | `--add` toggle | `SROCK_CONFIG` | Meaning |
 |---|---|---|

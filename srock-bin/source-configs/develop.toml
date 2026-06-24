@@ -1,0 +1,9 @@
+# develop source config: native TheRock.
+#
+# Builds TheRock's mainline sources with no srock compiler overrides or patches.
+# A compiler_branch of "develop" is the sentinel the srock setup script uses to
+# skip the compiler-submodule branch switch and patch application entirely, so
+# this builds exactly what upstream TheRock's `main` branch records.
+description = "Native upstream TheRock: main branch, no compiler override or patches"
+therock_branch = "main"
+compiler_branch = "develop"
