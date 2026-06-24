@@ -487,39 +487,125 @@ class TheRockBackend(Backend):
                     out.add(norm)
         return out
 
+    def _disabled_features(
+        self, args: argparse.Namespace, catalog: dict[str, dict]
+    ) -> set[str]:
+        """The THEROCK_ENABLE_* features the user asked to turn off via --remove.
+
+        Symmetric with _requested_features: a --remove token is a feature
+        *disable* request when its normalized form is in the current feature
+        catalog (or, on a cold start with no catalog yet, any non-special token).
+        For TheRock, a feature-backed subproject (e.g. amd-dbgapi / rocgdb) is
+        removed from the build by switching its feature off at configure time --
+        not by pruning the orchestrator task list, which the whole-tree install
+        would rebuild anyway."""
+        cold = not catalog
+        out: set[str] = set()
+        for entry in getattr(args, "remove", None) or []:
+            for tok in str(entry).split(","):
+                tok = tok.strip()
+                if not tok or tok.lower() in _SPECIAL_TOGGLES:
+                    continue
+                norm = _normalize_feature(tok)
+                if norm in catalog or cold:
+                    out.add(norm)
+        return out
+
+    def _cascade_disables(
+        self, disabled: set[str], catalog: dict[str, dict]
+    ) -> set[str]:
+        """Expand a disable set with every enabled feature that requires one of
+        its members (transitively).
+
+        TheRock features form a `requires` DAG (e.g. ROCGDB requires AMD_DBGAPI).
+        Disabling a feature must also disable anything that depends on it, or the
+        configure would be inconsistent. Walks the reverse of `requires` to a
+        fixpoint, only pulling in features currently marked enabled (disabling an
+        already-off feature is a no-op). Returns the full disable set."""
+        full = set(disabled)
+        changed = True
+        while changed:
+            changed = False
+            for fname, meta in catalog.items():
+                if fname in full:
+                    continue
+                if not (meta or {}).get("enabled", False):
+                    continue
+                requires = set((meta or {}).get("requires", []) or [])
+                if requires & full:
+                    full.add(fname)
+                    changed = True
+        return full
+
     def _apply_feature_flags(
         self, env: dict[str, str], info: dict[str, str],
         args: argparse.Namespace,
     ) -> None:
-        """Validate requested features and, under --reconfigure, append their
-        -DTHEROCK_ENABLE_<X>=ON flags to SROCK_CMAKE_EXTRA so the (re)configure
-        picks them up. Without --reconfigure, requesting a feature that is not
-        already enabled is a hard error (a reconfigure would wipe build/)."""
+        """Validate requested feature enables/disables and, under --reconfigure,
+        append their -DTHEROCK_ENABLE_<X>=ON/OFF flags to SROCK_CMAKE_EXTRA so the
+        (re)configure picks them up. Without --reconfigure, changing a feature's
+        current state is a hard error (a reconfigure would wipe build/)."""
         catalog = self._read_feature_map(
             os.path.join(info["BUILD_DIR"], FEATURE_MAP)
         )
         requested = self._requested_features(args, catalog)
-        if not requested:
+        disables = self._disabled_features(args, catalog)
+
+        # A token cannot both enable and disable a feature.
+        conflict = requested & disables
+        if conflict:
+            names = ", ".join(sorted(f.lower() for f in conflict))
+            core._fail(
+                f"feature(s) given to both --add and --remove: {names}."
+            )
+
+        # Disabling a feature drags down anything that requires it.
+        cascaded = self._cascade_disables(disables, catalog) - disables
+        disables |= cascaded
+
+        if not requested and not disables:
             return
+
         if not bool(getattr(args, "reconfigure", False)):
-            disabled = sorted(
+            # A change relative to the current configuration: an enable of a
+            # not-yet-enabled feature, or a disable of a currently-enabled one.
+            pending_on = sorted(
                 f for f in requested
                 if not catalog.get(f, {}).get("enabled", False)
             )
-            if disabled:
-                names = ", ".join(f.lower() for f in disabled)
+            pending_off = sorted(
+                f for f in disables
+                if catalog.get(f, {}).get("enabled", False)
+            )
+            problems = []
+            if pending_on:
+                problems.append(
+                    "not enabled: " + ", ".join(f.lower() for f in pending_on)
+                )
+            if pending_off:
+                problems.append(
+                    "still enabled: " + ", ".join(f.lower() for f in pending_off)
+                )
+            if problems:
                 core._fail(
-                    f"requested feature(s) not enabled in the current TheRock "
-                    f"configuration: {names}.\n"
+                    f"requested feature change(s) require a reconfigure "
+                    f"({'; '.join(problems)}).\n"
                     f"  Re-run with --reconfigure to apply them (reconfigures "
                     f"TheRock and regenerates the build maps)."
                 )
-            return  # already enabled; nothing to (re)configure
-        flags = " ".join(
-            f"-DTHEROCK_ENABLE_{f}=ON" for f in sorted(requested)
-        )
+            return  # already in the requested state; nothing to (re)configure
+
+        if cascaded:
+            print(
+                f"{core.PROG}: also disabling feature(s) that require the "
+                f"removed one(s): "
+                f"{', '.join(sorted(f.lower() for f in cascaded))}",
+                flush=True,
+            )
+        flags = [f"-DTHEROCK_ENABLE_{f}=ON" for f in sorted(requested)]
+        flags += [f"-DTHEROCK_ENABLE_{f}=OFF" for f in sorted(disables)]
         extra = env.get("SROCK_CMAKE_EXTRA", "")
-        env["SROCK_CMAKE_EXTRA"] = f"{extra} {flags}".strip()
+        env["SROCK_CMAKE_EXTRA"] = f"{extra} {' '.join(flags)}".strip()
         if self._child_env is not None:
             self._child_env["SROCK_CMAKE_EXTRA"] = env["SROCK_CMAKE_EXTRA"]
 

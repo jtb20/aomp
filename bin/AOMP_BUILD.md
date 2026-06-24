@@ -118,7 +118,7 @@ aomp_build.py [options] [selector ...]
 | Option | Description |
 |--------|-------------|
 | `list` (selector) | Print the numbered task list and exit (`[NNN] [✓] component/stage`; the tick marks completed tasks, see [Completion stamps](#completion-stamps)). Trailing selectors preview a focused build: `list amd-llvm` marks every other already-built component `[pinned]` (TheRock only, see [Incremental focus](#incremental-focus-auto-pin-out-of-scope-components)). |
-| `list-features` (selector) | Print the backend's configurable features and exit (TheRock only: the `THEROCK_ENABLE_*` flags, with ✓/✗ enabled state). Enable one with `--add <name> --reconfigure`. |
+| `list-features` (selector) | Print the backend's configurable features and exit (TheRock only: the `THEROCK_ENABLE_*` flags, with ✓/✗ enabled state). Enable one with `--add <name> --reconfigure`, disable one (cascading to dependents) with `--remove <name> --reconfigure`. |
 | `list-shards` (selector) | Print the backend's shard catalog and exit (TheRock only: the `BUILD_TOPOLOGY.toml` artifact groups, with their subprojects, dependency groups, and artifact counts). Drive one with `--import-shard` / `--build-shard` / `--export-shard(s)`. See [Sharding](#sharding). |
 | `list-configs` (selector) | Print the backend's source configs and exit (TheRock only: the branches each `-c/--config` selects, with the default marked). See [Source config](#source-config-which-sources-to-build-via--c--config). |
 | `-a`, `--all` | (TheRock only) Elaborate *every* advertised per-subproject action (`expunge/configure/build/stage/dist`) instead of the default `configure/build/stage`. Use with `list` to see the full capability set, or with a selector to run a normally-hidden action (e.g. `-a amd-llvm/expunge`). See [TheRock backend](#therock-backend). |
@@ -747,6 +747,49 @@ therock_build.py --add hipdnn list
 Requesting a feature that is already enabled is a no-op (no flag appended, no
 reconfigure forced), so `--add <feature>` is safe to leave in a command line
 across incremental builds.
+
+#### Disabling a feature (`--remove <feature> --reconfigure`)
+
+`--remove` is the mirror image of `--add` for features: naming a
+`THEROCK_ENABLE_*` feature with `--remove` **together with `--reconfigure`**
+appends `-DTHEROCK_ENABLE_<NAME>=OFF` to the cmake invocation, so the feature's
+subprojects vanish from the regenerated `subproject_map.json` — removing them
+from tasks, dist, and install in one shot:
+
+```
+therock_build.py -c develop --add sysdeps -s therock-src -p therock-prereq \
+  -i therock-install --remove amd-dbgapi,rocgdb --reconfigure
+```
+
+Disabling a feature **auto-cascades to its dependents**: anything currently
+enabled whose `requires` includes the removed feature is disabled too (the
+backend prints a one-line note of the cascaded features). For example
+`--remove amd-dbgapi` also turns off `rocgdb`, because `ROCGDB requires
+AMD_DBGAPI`; disabling `rocgdb` alone leaves `amd-dbgapi` on.
+
+Like `--add`, a `--remove` that would actually *change* the configuration —
+disabling a feature that is currently enabled — is a hard error without
+`--reconfigure` (and the previous silent no-op is gone):
+
+```
+therock_build.py --remove amd-dbgapi list
+# error: requested feature change(s) require a reconfigure
+#        (still enabled: amd-dbgapi).
+#          Re-run with --reconfigure to apply them (...).
+```
+
+Removing a feature that is already disabled (or an unknown token) is a no-op,
+and naming the same feature in both `--add` and `--remove` is an error.
+
+> **Name overlap:** `amd-dbgapi` and `rocgdb` are *both* subproject names and
+> feature names (`AMD_DBGAPI`, `ROCGDB`). `--remove` resolves them as features
+> and disables them at configure time, which is what genuinely excludes them.
+
+> **Limitation:** `--remove` only honestly excludes things that have a
+> `THEROCK_ENABLE_*` toggle. Removing a non-feature subproject merely prunes it
+> from the orchestrator's per-subproject task list; the whole-tree
+> `therock/install` still builds and installs it, because the minimal config
+> leaves it enabled in cmake.
 
 ### Leading pseudo-task (prereq toolchain)
 
