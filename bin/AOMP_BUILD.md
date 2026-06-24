@@ -520,6 +520,7 @@ Each shard verb is its own option, all taking a comma-separated group list:
 | Option | Effect |
 | --- | --- |
 | `--build-shard LIST` | Build these groups' subprojects (and their `artifact-group-<g>` targets). Sources are fetched for **only** these groups' source sets (`fetch_sources.py --source-sets`). |
+| `-f` / `--fill` | Build **every configured group not named by `--import-shard`** (the inverse of the import set), in build order — so you need not hand-calculate the build set. Implies `--deploy`; mutually exclusive with `--build-shard`. |
 | `--import-shard LIST` | Before building, import these (producer) groups' artifacts into the build tree as prebuilt, via `buildctl.py bootstrap`. |
 | `--export-shard LIST` | After building, copy these (producer) groups' artifacts to the store (the `shard_artifacts.py export-local` helper). |
 | `--export-shards` | Sugar for "export every group named by `--build-shard`" (so the build set need not be repeated). |
@@ -554,7 +555,22 @@ therock_build.py --import-shard compiler --build-shard math-libs \
 
 # Export an already-built group on its own (no rebuild).
 therock_build.py --export-shard math-libs --shard-store /shared/rocm-artifacts
+
+# Import the prebuilt sysdeps + debug tools, build everything else, and install
+# it -- a complete compiler without ever building sysdeps/rocgdb locally. `-f`
+# computes the build set as "every configured group except those imported" and
+# implies --deploy (assemble + install).
+therock_build.py --add sysdeps -s therock-src -p therock-prereq -i therock-install \
+    --shard-store therock-shards --import-shard third-party-sysdeps,debug-tools -f
 ```
+
+`-f/--fill` is the "give me the rest, ready to use" shortcut: instead of naming
+each `--build-shard` that complements your imports, you name only what you
+*import* and `-f` builds the remaining configured groups (in dependency order)
+and deploys them. A group with no configured subprojects (feature-disabled in
+the current profile) is not part of the fill set. If every configured group was
+imported (nothing left to build), `-f` errors rather than silently doing
+nothing.
 
 `--import-shard`/`--export-shard` name **producer** groups: import pulls a
 group's *produced* artifacts; export pushes them. Import resolves each producer

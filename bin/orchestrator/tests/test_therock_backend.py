@@ -1681,6 +1681,70 @@ class TopologyShardTest(unittest.TestCase):
                          [os.path.join(self.therock, "build_tools",
                                        "buildctl.py"), "enable"])
 
+    def test_rest_build_shards_excludes_imports(self) -> None:
+        # The FIXTURE configures groups {base, compiler, math-libs}; importing
+        # 'base' leaves the other two as the fill set, in build order.
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        backend.load_config(args)
+        env = backend.build_child_env(args)
+        rest = backend.rest_build_shards(["base"], env)
+        self.assertEqual(set(rest), {"compiler", "math-libs"})
+        self.assertNotIn("base", rest)
+        # Build order: a subset of group_names, in the same relative order.
+        order = topology.group_names(topology.load_build_topology(self.therock))
+        self.assertEqual(rest, [g for g in order if g in set(rest)])
+
+    def test_rest_build_shards_without_imports_is_all_configured(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        backend.load_config(args)
+        env = backend.build_child_env(args)
+        rest = backend.rest_build_shards([], env)
+        self.assertEqual(set(rest), {"base", "compiler", "math-libs"})
+
+    def test_fill_implies_deploy_and_excludes_imported_group(self) -> None:
+        # `--import-shard base -f list` previews a pipeline that builds the fill
+        # groups (compiler/math-libs), deploys (therock/install present), and
+        # builds nothing from the imported 'base' group (rocm-cmake).
+        backend = TheRockBackend()
+        args = make_args(
+            self.therock, self.repos, "--import-shard", "base", "-f", "list",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = core.run(args, backend)
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("therock/install", out)         # deploy implied
+        self.assertIn("therock/import-base", out)      # import preserved
+        self.assertIn("amd-llvm/", out)                # compiler group built
+        self.assertIn("hipBLAS/", out)                 # math-libs group built
+        # rocm-cmake (the imported 'base' group) is not built.
+        self.assertNotIn("rocm-cmake/", out)
+        # The computed-fill note is printed.
+        self.assertIn("--fill: building", out)
+
+    def test_fill_conflicts_with_build_shard(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(
+            self.therock, self.repos,
+            "-f", "--build-shard", "compiler", "list",
+        )
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(io.StringIO()):
+                core.run(args, backend)
+
+    def test_fill_with_no_configured_shards_fails(self) -> None:
+        # Without artifact_map.json the subproject->group map is empty, so no
+        # group is "configured" and --fill has nothing to build.
+        os.remove(os.path.join(self.build, "artifact_map.json"))
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "-f", "list")
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(io.StringIO()):
+                core.run(args, backend)
+
 
 class TtyStream(io.StringIO):
     """A StringIO that claims to be a TTY, for exercising StatusLine output."""

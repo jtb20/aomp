@@ -177,6 +177,19 @@ class Backend(ABC):
         counts). Default: None."""
         return None
 
+    def rest_build_shards(
+        self, import_shards: list[str], env: dict[str, str],
+    ) -> list[str] | None:
+        """The configured shards to build for -f/--fill: every artifact group
+        with at least one configured subproject, minus ``import_shards``, in
+        dependency (build) order.
+
+        Used so a user can pass --import-shard X,Y -f and get a complete,
+        deployed build without hand-calculating the inverse --build-shard set.
+        Returns None if the backend has no shard concept / no topology is
+        available. Default: None."""
+        return None
+
     def shard_tasks(
         self, tasks: list[Task], import_shards: list[str],
         build_shards: list[str], export_shards: list[str],

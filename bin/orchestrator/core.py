@@ -1138,6 +1138,13 @@ def add_backend_options(
              "those groups.",
     )
     shard.add_argument(
+        "-f", "--fill", action="store_true",
+        help="build every configured shard (artifact group) NOT named by "
+             "--import-shard, so you need not hand-calculate the inverse of "
+             "--import-shard. Implies --deploy (assemble + install). TheRock "
+             "only; mutually exclusive with --build-shard. See `list-shards`.",
+    )
+    shard.add_argument(
         "--export-shard", default=None, metavar="LIST",
         help="comma-separated producer shard(s) (artifact groups) whose built "
              "artifacts to export to --shard-store after building.",
@@ -1351,9 +1358,32 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
     shard_import = parse_shard_list(getattr(args, "import_shard", None))
     shard_build = parse_shard_list(getattr(args, "build_shard", None))
     shard_export = parse_shard_list(getattr(args, "export_shard", None))
+
+    # -f/--fill: build every configured shard not named by --import-shard, so
+    # the user need not hand-calculate the inverse build set. It owns the build
+    # set (mutually exclusive with --build-shard) and implies --deploy so the
+    # imported + freshly-built shards are assembled and installed.
+    if getattr(args, "fill", False):
+        if shard_build:
+            _fail("--fill is mutually exclusive with --build-shard (it builds "
+                  "every configured shard not imported).")
+        rest = backend.rest_build_shards(shard_import, child_env)
+        if rest is None:
+            _fail("this backend does not support group-based sharding "
+                  "(--fill / --import-shard / --build-shard / --export-shard)")
+        if not rest:
+            _fail("--fill found no configured shards to build (all configured "
+                  "groups were imported, or the build is not configured / "
+                  "artifact_map.json is missing). Re-run with --reconfigure or "
+                  "drop --fill.")
+        shard_build = rest
+        print(f"{PROG}: --fill: building {len(rest)} shard(s) not imported: "
+              f"{', '.join(rest)}")
+
     if getattr(args, "export_shards", False):
         shard_export += [s for s in shard_build if s not in shard_export]
     shard_mode = bool(shard_import or shard_build or shard_export)
+    deploy = bool(getattr(args, "deploy", False) or getattr(args, "fill", False))
 
     if shard_mode:
         pipeline = backend.shard_tasks(
@@ -1363,11 +1393,12 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
             _fail("this backend does not support group-based sharding "
                   "(--import-shard / --build-shard / --export-shard)")
         tasks = backend.leading_tasks(components, child_env) + pipeline
-        # --deploy re-enables the trailing whole-tree dist + install steps so a
-        # shard run also assembles the imported + freshly-built shards into the
-        # combined dist tree and the final install dir (otherwise a shard run
-        # only produces/pushes artifacts).
-        if getattr(args, "deploy", False):
+        # --deploy (or its implied form via --fill) re-enables the trailing
+        # whole-tree dist + install steps so a shard run also assembles the
+        # imported + freshly-built shards into the combined dist tree and the
+        # final install dir (otherwise a shard run only produces/pushes
+        # artifacts).
+        if deploy:
             tasks += backend.trailing_tasks(components, child_env)
     else:
         # Leading whole-build pseudo-tasks (e.g. TheRock's `therock/prereq`,
