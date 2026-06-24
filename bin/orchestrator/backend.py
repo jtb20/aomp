@@ -154,15 +154,33 @@ class Backend(ABC):
         return None
 
     # --- sharding (optional) --------------------------------------------- #
-    def shard_run_lengths(
-        self, tasks: list[Task], env: dict[str, str]
-    ) -> list[int] | None:
-        """Preferred contiguous run boundaries for --shard, or None.
+    def list_shards(self, env: dict[str, str]) -> list[dict] | None:
+        """Rows for the `list-shards` selector, or None if the backend has no
+        shard concept.
 
-        The default (None) makes --shard split the dependency-ordered task list
-        into N balanced segments by task count. A backend may instead return the
-        lengths of contiguous runs (summing to len(tasks)) that the shard cut
-        points should snap to -- e.g. TheRock groups tasks by build *stage* so a
-        shard boundary never splits a stage. Returning a grouping never reorders
-        tasks; it only biases where the N cuts fall."""
+        A shard is a unit of distributed work. For TheRock these are the
+        artifact *groups* from BUILD_TOPOLOGY.toml. Each row is a dict with at
+        least 'name'; the TheRock backend also reports 'description',
+        'subprojects' (the cmake subprojects the group builds), 'source_sets',
+        'depends_on' (dependency groups), and 'produced'/'inbound' (artifact
+        counts). Default: None."""
+        return None
+
+    def shard_tasks(
+        self, tasks: list[Task], import_shards: list[str],
+        build_shards: list[str], export_shards: list[str],
+        env: dict[str, str], args: argparse.Namespace,
+    ) -> list[Task] | None:
+        """The ordered task list for a group-based shard run, or None if the
+        backend does not support sharding.
+
+        `tasks` is the full dependency-ordered per-component task list (before
+        leading/trailing pseudo-tasks), from which the backend selects the
+        subprojects belonging to the build shards (artifact groups). Produces
+        the import -> build -> export pipeline for the named groups: import
+        fetches upstream artifacts into the build tree, build runs the group's
+        own subprojects (plus its artifact-group target), and export pushes the
+        produced artifacts. The returned tasks replace the normal selection (the
+        core skips trailing whole-tree tasks for a shard run). Default: None
+        (unsupported)."""
         return None

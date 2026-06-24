@@ -119,6 +119,7 @@ aomp_build.py [options] [selector ...]
 |--------|-------------|
 | `list` (selector) | Print the numbered task list and exit (`[NNN] [✓] component/stage`; the tick marks completed tasks, see [Completion stamps](#completion-stamps)). Trailing selectors preview a focused build: `list amd-llvm` marks every other already-built component `[pinned]` (TheRock only, see [Incremental focus](#incremental-focus-auto-pin-out-of-scope-components)). |
 | `list-features` (selector) | Print the backend's configurable features and exit (TheRock only: the `THEROCK_ENABLE_*` flags, with ✓/✗ enabled state). Enable one with `--add <name> --reconfigure`. |
+| `list-shards` (selector) | Print the backend's shard catalog and exit (TheRock only: the `BUILD_TOPOLOGY.toml` artifact groups, with their subprojects, dependency groups, and artifact counts). Drive one with `--import-shard` / `--build-shard` / `--export-shard(s)`. See [Sharding](#sharding). |
 | `-a`, `--all` | (TheRock only) Elaborate *every* advertised per-subproject action (`expunge/configure/build/stage/dist`) instead of the default `configure/build/stage`. Use with `list` to see the full capability set, or with a selector to run a normally-hidden action (e.g. `-a amd-llvm/expunge`). See [TheRock backend](#therock-backend). |
 | `--components` | Print the resolved, dependency-ordered component list and exit. |
 | `-n`, `--dry-run` | Show what would run (command + log path per task) without executing. |
@@ -260,6 +261,7 @@ run. The grammar mirrors `amd-build`:
 | *(none)* | Run all elaborated tasks. |
 | `list` | Print the numbered task list and exit (does not run anything). Trailing selectors preview a focused build, marking out-of-scope built components `[pinned]` (TheRock). |
 | `list-features` | Print the backend's configurable features and exit (TheRock: the `THEROCK_ENABLE_*` flags). Does not run anything. |
+| `list-shards` | Print the backend's shard catalog and exit (TheRock: the `BUILD_TOPOLOGY.toml` artifact groups). Does not run anything. |
 | `N` | Run task number `N` (1-based, as shown by `list`). |
 | `N--M` | Run the inclusive range of tasks `N` through `M`. |
 | `comp/variant/stage` | Glob/substring match on task names; supports `{a,b}` brace expansion. |
@@ -483,27 +485,94 @@ Manifests live under `<BUILD_DIR>/manifests/` by default
 
 ## Sharding
 
-`--shard k/N` runs only the `k`-th of `N` slices of the build, so a large build
-can be split across machines (or across separate invocations). The flag composes
-with selectors and with the completion stamps.
+Sharding splits a large build across machines (or separate invocations) along
+**TheRock's artifact groups** — the `[artifact_groups]` of `BUILD_TOPOLOGY.toml`
+(e.g. `third-party-sysdeps`, `compiler`, `core-runtime`, `math-libs`). A shard
+*is* an artifact group. Groups are the finest unit TheRock tracks dependencies
+between, so this lets you, for example, import the slow-moving
+`third-party-sysdeps` and `third-party-libs` once and rebuild only `compiler`
+day to day, instead of treating the whole `compiler-runtime` stage as one lump.
 
-Because the elaborated task list is already in dependency order, each shard is a
-**contiguous segment** of that list. This is what makes the split safe: running
-shards `1..N` in order reproduces a full build, and a single shard's segment can
-run on its own machine as long as the earlier shards' outputs (the shared
-source / build / install tree) are present.
+Sharding is therefore a **TheRock-backend feature** (the aomp backend has no
+group/artifact model). List the available shards — in dependency (build) order
+— with `list-shards`:
 
 ```bash
-# Split the full build into four slices and run the second.
-aomp_build.py --shard 2/4
-
-# Combine with selectors: shard 1 of 3, but only the rocmlibs tasks.
-aomp_build.py 'rocmlibs/*' --shard 1/3
+therock_build.py list-shards
+# compiler  - AMD LLVM toolchain and compiler infrastructure
+#   builds    : amd-llvm, amd-comgr, hipcc  (3)
+#   imports   : third-party-sysdeps
+#   sources   : compilers
+#   artifacts : 2 produced, 9 inbound
+# core-runtime  - Core runtime (ROCR-Runtime, rocminfo)
+#   builds    : ROCR-Runtime, rocminfo  (2)
+#   imports   : third-party-sysdeps, base
+#   ...
 ```
 
-Segments are balanced by task count (the earlier shards take the remainder when
-the count does not divide evenly). The TheRock backend refines *where* the cuts
-fall so a shard boundary never splits a build stage — see below.
+`builds` reflects the *current configure* (only enabled subprojects appear); the
+other fields are intrinsic to the topology.
+
+Each shard verb is its own option, all taking a comma-separated group list:
+
+| Option | Effect |
+| --- | --- |
+| `--build-shard LIST` | Build these groups' subprojects (and their `artifact-group-<g>` targets). Sources are fetched for **only** these groups' source sets (`fetch_sources.py --source-sets`). |
+| `--import-shard LIST` | Before building, import these (producer) groups' artifacts into the build tree as prebuilt, via `buildctl.py bootstrap`. |
+| `--export-shard LIST` | After building, copy these (producer) groups' artifacts to the store (the `shard_artifacts.py export-local` helper). |
+| `--export-shards` | Sugar for "export every group named by `--build-shard`" (so the build set need not be repeated). |
+| `--shard-store DIR` | Local artifact store shared between import/export (TheRock's `THEROCK_LOCAL_STAGING_DIR`). Default: `<BUILD_DIR>/shard-artifacts`. |
+| `--shard-run-id LABEL` | Run-id namespace under the store for push/import (default `local`). |
+| `--shard-families LIST` | Extra target families (e.g. `gfx94X`) to import for per-arch artifacts, in addition to `generic`. |
+| `--deploy` | Also assemble the imported + built shards into the combined dist tree and final install dir (re-enables the trailing `therock/dist` + `therock/install` steps a shard run otherwise skips). No effect outside shard mode. |
+
+When any shard option is given the run becomes the
+**import → build → export** pipeline for the named groups (the leading
+`therock/prereq` toolchain step still runs; the trailing whole-tree
+dist/install is skipped — a shard produces and pushes artifacts, it does not
+assemble the full SDK). Pass `--deploy` to re-enable that assembly so the
+imported and freshly-built shards land in the dist/install tree on this
+machine.
+
+```bash
+# Machine A: build the compiler group and publish its artifacts to the store.
+# (third-party-sysdeps is imported; see list-shards for a group's deps.)
+therock_build.py --import-shard third-party-sysdeps --build-shard compiler \
+    --export-shards --shard-store /shared/rocm-artifacts
+
+# Machine B: pull the compiler artifacts, then build math-libs against them
+# and publish math-libs too. Only math-libs' sources are fetched here.
+therock_build.py --import-shard compiler --build-shard math-libs \
+    --export-shards --shard-store /shared/rocm-artifacts --shard-families gfx94X
+
+# Same, but also assemble the imported compiler + built math-libs into the
+# local dist/install tree (not just artifacts) with --deploy.
+therock_build.py --import-shard compiler --build-shard math-libs \
+    --deploy --shard-store /shared/rocm-artifacts --shard-families gfx94X
+
+# Export an already-built group on its own (no rebuild).
+therock_build.py --export-shard math-libs --shard-store /shared/rocm-artifacts
+```
+
+`--import-shard`/`--export-shard` name **producer** groups: import pulls a
+group's *produced* artifacts; export pushes them. Import resolves each producer
+group to its artifact names from the topology and hands a filtered view of the
+store to `buildctl.py bootstrap`.
+
+Because `bootstrap` only drops `.prebuilt` markers and stages files (TheRock
+honors them at *configure* time), the pipeline inserts a `therock/shard-pin`
+step after the imports — `buildctl.py enable <build-group subprojects>
+--force-reconfigure` — which reconfigures so the imported subprojects are
+treated as prebuilt and the build groups' subprojects build against them rather
+than rebuilding the imports. (In shard mode this replaces the normal
+[auto-pin](#incremental-focus-auto-pin-out-of-scope-components), which would
+otherwise run before anything is staged.)
+
+Mapping subprojects to groups requires an **artifact → subproject** map
+(`artifact_map.json`), emitted by the bundled introspection alongside
+`subproject_map.json` once TheRock is (re)configured with introspection. On a
+checkout that has not yet been reconfigured, `list-shards` shows groups with no
+`builds` subprojects; run a build (or `--reconfigure`) to populate it.
 
 ---
 
@@ -514,7 +583,7 @@ package) and pluggable backends. The default **aomp** backend drives the
 per-component `build_<name>.sh` scripts described throughout this document. The
 **therock** backend instead drives [TheRock](https://github.com/ROCm/TheRock)'s
 single CMake super-build, exposing the *same* workflow (resolve, order,
-elaborate, list/run/continue, log, stamp, shard, manifest).
+elaborate, list/run/continue, log, stamp, manifest) plus group-based sharding.
 
 Select it with `--backend therock`, or use the dedicated entry point
 [`bin/therock_build.py`](therock_build.py) (identical, but defaulting to the
@@ -524,7 +593,8 @@ TheRock backend):
 therock_build.py list                 # numbered subproject+action task list
 therock_build.py -n                   # dry-run the whole build
 therock_build.py 'amd-llvm/*'         # just the compiler's tasks
-therock_build.py --shard 1/3          # stage-aligned shard
+therock_build.py list-shards          # list artifact groups (shards)
+therock_build.py --build-shard math-libs --import-shard compiler --export-shards
 ```
 
 ### Where the build graph comes from
@@ -843,14 +913,22 @@ self-contained and needs no system packages or user prefixes. If you maintain
 those tools elsewhere, `--inherit-path` (use your `PATH`) and
 `--pass-env VAR[,VAR...]` remain available.
 
-### Stage-aligned sharding
+### Group-based sharding
 
 TheRock ships a static `BUILD_TOPOLOGY.toml` (parsed via its own
-`build_topology` module) describing the CI/CD build *stages* and the git
-submodules each stage needs. When that topology is available, the therock
-backend snaps `--shard` cut points to **stage boundaries** so a shard never
-splits a stage — falling back to the plain count-based split when the topology
-cannot be loaded. Tasks are never reordered; only the cut positions change.
+`build_topology` module) describing the artifact *groups*, the artifacts each
+group produces/consumes, and the source sets (git submodules) each group needs.
+The therock backend exposes those groups as **shards**: `list-shards` enumerates
+them in dependency order, and `--import-shard` / `--build-shard` /
+`--export-shard(s)` drive the native import → build → export pipeline (using
+`fetch_sources.py --source-sets`, `buildctl.py bootstrap`, the per-group
+`ninja artifact-group-<g>` targets, and the `shard_artifacts.py export-local`
+helper). To select and pin exactly each group's subprojects, the backend reads
+an `artifact_map.json` (artifact → composing subprojects) emitted by the bundled
+introspection — for which it records a `THEROCK_ARTIFACT_SUBPROJECT_DEPS`
+property on each artifact target in `cmake/therock_artifacts.cmake`. See
+[Sharding](#sharding) for the full option set and examples. Sharding is
+unavailable when the topology cannot be loaded.
 
 ### Manifest
 
@@ -1294,6 +1372,8 @@ not inherited. Use `--inherit-path` to restore your `PATH`, and/or
   [`bin/orchestrator/backend.py`](orchestrator/backend.py) (config loading,
   environment, task listing, and per-task command) and register it in
   `core.make_backend()`. The generic core (resolution, ordering, selectors,
-  execution, stamps, sharding, manifest) is reused unchanged — see the
+  execution, stamps, manifest, and the `list-shards` / `--*-shard` wiring that
+  defers to the backend's optional `list_shards`/`shard_tasks` hooks) is reused
+  unchanged — see the
   [TheRock backend](orchestrator/therock_backend.py) for a worked example that
   is driven by introspection JSON rather than per-component scripts.
