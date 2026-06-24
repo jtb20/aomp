@@ -3,7 +3,7 @@
 
 Synthetic-fixture tests (no real TheRock build) covering the full flow:
 introspection JSON -> Config graph -> elaborated tasks -> ninja commands ->
-stage-based sharding. Run directly or via unittest:
+group-based sharding. Run directly or via unittest:
 
     python3 bin/orchestrator/tests/test_therock_backend.py
     python3 -m unittest discover -s bin/orchestrator/tests
@@ -1062,7 +1062,7 @@ class ShardArtifactsHelperTest(unittest.TestCase):
     f"no TheRock checkout at {THEROCK_SRC}",
 )
 class TopologyShardTest(unittest.TestCase):
-    """Exercises the real build_topology adapter and stage-based sharding."""
+    """Exercises the real build_topology adapter and group-based sharding."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="therock-topo-")

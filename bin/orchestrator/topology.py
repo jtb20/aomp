@@ -2,11 +2,12 @@
 
 TheRock already ships a static, checked-in description of its build topology in
 ``BUILD_TOPOLOGY.toml`` plus an importable parser
-(``build_tools/_therock_utils/build_topology.py``) that knows the CI/CD build
-*stages*, the artifact groups and their dependencies, and the git submodules
-each stage needs. This adapter loads that parser from a TheRock checkout (when
-available) so the orchestrator can drive stage-based shards: each shard is a
-build stage, and import/build/export operate on its artifacts and subprojects.
+(``build_tools/_therock_utils/build_topology.py``) that knows the artifact
+*groups* and their dependencies, the build stages, and the git submodules
+(source sets) each needs. This adapter loads that parser from a TheRock checkout
+(when available) so the orchestrator can drive group-based shards: each shard is
+an artifact group, and import/build/export operate on its artifacts and
+subprojects.
 
 Everything here degrades gracefully: if the checkout, the TOML, or a suitable
 TOML parser (``tomllib`` on 3.11+, else ``tomli``) is missing, the loader
