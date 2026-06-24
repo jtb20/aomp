@@ -825,6 +825,21 @@ class TheRockBackend(Backend):
             )
             reconfigure = True
 
+        # A switch is destructive (branch checkout + working-tree reset). Never
+        # perform it during a dry run -- preview against the current sources.
+        if switch_needed and getattr(self._args, "dry_run", False):
+            print(
+                f"{core.PROG}: (dry-run) would switch sources "
+                f"({from_label}) -> '{desired_cfg}' (branch checkout + "
+                f"reconfigure); previewing with the current sources.", flush=True,
+            )
+            if os.path.isfile(json_path):
+                return json_path
+            core._fail(
+                "(dry-run) cannot preview a switch with no existing "
+                "subproject_map.json; configure once without -n first."
+            )
+
         if os.path.isfile(json_path) and not reconfigure:
             return json_path
         if not reconfigure:
@@ -866,6 +881,9 @@ class TheRockBackend(Backend):
             if rc != 0:
                 core._fail(f"TheRock setup failed (rc={rc})")
         elif switch_needed:
+            # Refuse to silently discard the user's uncommitted changes / local
+            # commits; confirm (or abort) before the destructive switch.
+            self._assert_switch_safe(therock_dir)
             print(
                 f"{core.PROG}: switching TheRock sources to '{desired_cfg}': "
                 f"{SETUP_SROCK} restart", flush=True,
@@ -900,6 +918,106 @@ class TheRockBackend(Backend):
         # a different --config detects the switch (see top of this method).
         self._write_source_marker(therock_dir, desired_cfg)
         return json_path
+
+    def _has_local_commits(self, repo: str) -> bool:
+        """True if ``repo``'s HEAD has commits not on any remote-tracking branch.
+
+        These are unpushed local commits -- the user's work that a branch switch
+        could leave behind. Requires remote refs to exist to be meaningful; with
+        none we cannot classify commits as "unpushed" and conservatively report
+        False (avoids flagging every commit in a remote-less checkout)."""
+        if not source_layout._git_out(repo, "for-each-ref", "refs/remotes"):
+            return False
+        out = source_layout._git_out(
+            repo, "rev-list", "--count", "HEAD", "--not", "--remotes"
+        )
+        try:
+            return int(out) > 0
+        except ValueError:
+            return False
+
+    def _switch_safety_report(
+        self, therock_dir: str
+    ) -> tuple[list[str], list[str]]:
+        """Scan the super-repo and its initialized submodules for at-risk work.
+
+        Returns ``(dirty, ahead)``: repos with uncommitted modifications (which a
+        switch's ``git checkout .`` would discard) and repos with unpushed local
+        commits (which a branch switch could leave behind). Submodule gitlink
+        changes are ignored (``--ignore-submodules=all``) so each repo reports
+        only its own file changes; nested submodules are scanned in their own
+        right via ``submodule status --recursive``."""
+        dirty: list[str] = []
+        ahead: list[str] = []
+        repos: list[tuple[str, str]] = [("TheRock (super-repo)", therock_dir)]
+        status = source_layout._git_out(
+            therock_dir, "submodule", "status", "--recursive"
+        )
+        for line in status.splitlines():
+            if not line:
+                continue
+            # " <sha> <path> (<desc>)"; leading char: ' ' ok, '+' tip differs,
+            # 'U' merge conflict, '-' uninitialized (nothing checked out -> skip).
+            indicator, body = line[0], line[1:]
+            if indicator == "-":
+                continue
+            _sha, _, tail = body.partition(" ")
+            path = tail.split(" (")[0].strip()
+            if path:
+                repos.append((path, os.path.join(therock_dir, path)))
+        for label, repo in repos:
+            if not source_layout.is_git_repo(repo):
+                continue
+            if source_layout._git_out(
+                repo, "status", "--porcelain", "--ignore-submodules=all"
+            ):
+                dirty.append(label)
+            if self._has_local_commits(repo):
+                ahead.append(label)
+        return dirty, ahead
+
+    def _assert_switch_safe(self, therock_dir: str) -> None:
+        """Guard a destructive in-place source-config switch.
+
+        The switch (setup_srock.sh restart) hard-resets the super-repo and every
+        submodule working tree and re-checks-out the compiler branches, silently
+        discarding uncommitted changes and possibly orphaning local commits. If
+        any tracked repo has uncommitted modifications or unpushed local commits,
+        list them and require confirmation. -y/--yes bypasses the prompt; a
+        decline (or a non-interactive session without -y) aborts the run so the
+        user's work is never lost without consent."""
+        dirty, ahead = self._switch_safety_report(therock_dir)
+        if not dirty and not ahead:
+            return
+        print(
+            "\nWARNING: switching the TheRock source config resets working trees "
+            "and re-checks-out branches, which can lose local work:"
+        )
+        if ahead:
+            print("  Repos with UNPUSHED LOCAL COMMITS (may be left behind):")
+            for label in ahead:
+                print(f"    - {label}")
+        if dirty:
+            print("  Repos with UNCOMMITTED CHANGES (will be discarded):")
+            for label in dirty:
+                print(f"    - {label}")
+            print("    (note: srock applies its compiler patches as uncommitted "
+                  "changes; those are expected and safe to discard.)")
+        if getattr(self._args, "yes", False):
+            print("  -y/--yes given; proceeding and discarding/leaving the above.")
+            return
+        try:
+            reply = input(
+                "\nProceed with the switch (commit or stash first to keep work)? "
+                "[y/N] "
+            ).strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            core._fail(
+                "source config switch aborted to preserve local work; commit or "
+                "stash your changes (or pass -y/--yes to discard them)."
+            )
 
     def _checked_out_branch(self, therock_dir: str) -> str | None:
         """The super-repo's current branch name, or None.

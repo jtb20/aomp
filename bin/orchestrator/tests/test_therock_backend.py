@@ -433,13 +433,20 @@ class SourceConfigSwitchTest(unittest.TestCase):
         args = make_args(self.therock, self.repos, "list")
         self._prime(backend, args)
         from unittest import mock
+        real_run = therock_backend.subprocess.run
 
-        def fake_run(cmd, *a, **kw):
+        # Patching subprocess.run patches the module globally (incl. the safety
+        # check's git queries), so let real git through and mock only the heavy
+        # bash reconfigure. The fixture is not a git repo, so the safety scan
+        # finds nothing and does not prompt.
+        def dispatch(cmd, *a, **kw):
+            if cmd[:1] == ["git"]:
+                return real_run(cmd, *a, **kw)
             return mock.Mock(returncode=0)
 
         buf = io.StringIO()
         with mock.patch.object(therock_backend.subprocess, "run",
-                               side_effect=fake_run) as run, \
+                               side_effect=dispatch) as run, \
                 redirect_stdout(buf):
             backend.load_config(args)
         # A reconfigure (restart) ran despite no --reconfigure. A switch runs
@@ -490,7 +497,10 @@ class SourceConfigSwitchTest(unittest.TestCase):
         self._git_init("main")
         self.assertIsNone(self._marker())
         backend = TheRockBackend()
-        args = make_args(self.therock, self.repos, "list")
+        # -y so the destructive-switch safety guard (the fixture's untracked
+        # files read as uncommitted changes) does not block; that guard is
+        # covered by its own tests below.
+        args = make_args(self.therock, self.repos, "-y", "list")
         self._prime(backend, args)
         from unittest import mock
         real_run = therock_backend.subprocess.run
@@ -532,6 +542,135 @@ class SourceConfigSwitchTest(unittest.TestCase):
         with mock.patch.object(therock_backend.subprocess, "run",
                                side_effect=dispatch) as run:
             backend.load_config(args)
+        self.assertFalse(
+            any(c.args[0][:1] == ["bash"] for c in run.call_args_list)
+        )
+
+    # --- destructive-switch safety guard ------------------------------------ #
+    def _git_init_committed(self, branch: str) -> None:
+        import subprocess as sp
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        sp.run(["git", "init", "-q", self.therock], check=True)
+        sp.run(["git", "-C", self.therock, "add", "-A"], check=True)
+        sp.run(["git", "-C", self.therock, "commit", "-q", "-m", "init"],
+               check=True, env=env)
+        sp.run(["git", "-C", self.therock, "branch", "-m", branch], check=True)
+
+    def _git_init_with_remote(self, branch: str) -> None:
+        import subprocess as sp
+        self._git_init_committed(branch)
+        bare = os.path.join(self.tmp, "origin.git")
+        sp.run(["git", "init", "-q", "--bare", bare], check=True)
+        sp.run(["git", "-C", self.therock, "remote", "add", "origin", bare],
+               check=True)
+        sp.run(["git", "-C", self.therock, "push", "-q", "-u", "origin", branch],
+               check=True)
+
+    def test_safety_report_clean_tree_is_empty(self) -> None:
+        self._git_init_committed("main")
+        dirty, ahead = TheRockBackend()._switch_safety_report(self.therock)
+        self.assertEqual((dirty, ahead), ([], []))
+
+    def test_safety_report_flags_uncommitted_changes(self) -> None:
+        self._git_init_committed("main")
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "a") as fh:
+            fh.write("# local edit\n")
+        dirty, ahead = TheRockBackend()._switch_safety_report(self.therock)
+        self.assertIn("TheRock (super-repo)", dirty)
+        self.assertEqual(ahead, [])
+
+    def test_safety_report_flags_local_commits(self) -> None:
+        self._git_init_with_remote("main")
+        import subprocess as sp
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        sp.run(["git", "-C", self.therock, "commit", "--allow-empty", "-q",
+                "-m", "local work"], check=True, env=env)
+        dirty, ahead = TheRockBackend()._switch_safety_report(self.therock)
+        self.assertIn("TheRock (super-repo)", ahead)
+
+    def test_assert_switch_safe_aborts_on_decline(self) -> None:
+        self._git_init_committed("main")
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "a") as fh:
+            fh.write("# local edit\n")
+        backend = TheRockBackend()
+        backend._args = make_args(self.therock, self.repos, "list")  # no -y
+        from unittest import mock
+        with mock.patch("builtins.input", return_value="n"), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                backend._assert_switch_safe(self.therock)
+
+    def test_assert_switch_safe_aborts_when_noninteractive(self) -> None:
+        self._git_init_committed("main")
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "a") as fh:
+            fh.write("# local edit\n")
+        backend = TheRockBackend()
+        backend._args = make_args(self.therock, self.repos, "list")  # no -y
+        from unittest import mock
+        with mock.patch("builtins.input", side_effect=EOFError), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                backend._assert_switch_safe(self.therock)
+
+    def test_assert_switch_safe_proceeds_with_yes(self) -> None:
+        self._git_init_committed("main")
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "a") as fh:
+            fh.write("# local edit\n")
+        backend = TheRockBackend()
+        backend._args = make_args(self.therock, self.repos, "-y", "list")
+        # -y: no prompt, no abort even though the tree is dirty.
+        with redirect_stdout(io.StringIO()):
+            backend._assert_switch_safe(self.therock)
+
+    def test_assert_switch_safe_proceeds_on_confirm(self) -> None:
+        self._git_init_committed("main")
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "a") as fh:
+            fh.write("# local edit\n")
+        backend = TheRockBackend()
+        backend._args = make_args(self.therock, self.repos, "list")
+        from unittest import mock
+        with mock.patch("builtins.input", return_value="y"), \
+                redirect_stdout(io.StringIO()):
+            backend._assert_switch_safe(self.therock)  # no raise
+
+    def test_assert_switch_safe_clean_tree_no_prompt(self) -> None:
+        self._git_init_committed("main")
+        backend = TheRockBackend()
+        backend._args = make_args(self.therock, self.repos, "list")
+        from unittest import mock
+        # input must never be called for a clean tree.
+        with mock.patch("builtins.input",
+                        side_effect=AssertionError("should not prompt")):
+            backend._assert_switch_safe(self.therock)
+
+    def test_dirty_switch_aborts_before_running_setup(self) -> None:
+        # End-to-end: a marker mismatch + dirty tree, no -y, declined -> abort
+        # before any setup_srock.sh runs (work is preserved).
+        self._git_init_committed("main")
+        with open(self.marker, "w") as fh:
+            fh.write("develop\n")  # forces switch to default amd-staging
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "a") as fh:
+            fh.write("# local edit\n")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")  # no -y
+        self._prime(backend, args)
+        from unittest import mock
+        real_run = therock_backend.subprocess.run
+
+        def dispatch(cmd, *a, **kw):
+            if cmd[:1] == ["git"]:
+                return real_run(cmd, *a, **kw)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(therock_backend.subprocess, "run",
+                               side_effect=dispatch) as run, \
+                mock.patch("builtins.input", return_value="n"), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                backend.load_config(args)
+        # No setup_srock.sh (bash) invocation happened -> nothing was reset.
         self.assertFalse(
             any(c.args[0][:1] == ["bash"] for c in run.call_args_list)
         )

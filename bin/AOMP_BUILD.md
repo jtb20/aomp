@@ -899,6 +899,16 @@ still takes effect on existing trees (a detached HEAD is left untouched; use
 folded into the export manifest name (e.g. `amd-staging-minimal` vs
 `develop-minimal`) so distinct selections never collide.
 
+Because a switch hard-resets working trees (`git checkout .`) and re-checks-out
+branches, it can discard local work. Before switching, the orchestrator scans
+the super-repo and its initialized submodules and, if any have **uncommitted
+changes** or **unpushed local commits**, lists them and **prompts for
+confirmation** — declining (or a non-interactive run) aborts so your work is
+never lost without consent. Commit or stash first to keep changes; pass
+`-y/--yes` to proceed and discard/leave them. (srock's own compiler patches show
+up as uncommitted changes and are safe to discard.) A `-n/--dry-run` never
+performs a switch — it previews against the current sources.
+
 #### Build set (SROCK_CONFIG) via `--add`
 
 The build set (`SROCK_CONFIG`) is a *configure toggle surfaced through `--add`*,
