@@ -44,6 +44,18 @@ list_repo
 return
 fi
 
+# Shared-source provisioning (orchestrator --therock-symlinks) replaces a
+# component's repo dir with a symlink into a canonical TheRock checkout. Never
+# clone/pull/checkout through such a symlink: a `-d` test passes for a symlink
+# to a directory, so the pull branch below would checkout/pull inside TheRock's
+# rocm-systems / rocm-libraries monorepo and mutate the canonical tree. Leave
+# it untouched.
+if [ -L "$AOMP_REPOS/rocmlibs/$reponame" ] ; then
+   echo
+   echo "--- Skipping $reponame: $AOMP_REPOS/rocmlibs/$reponame is a symlink to a shared (TheRock) source ---"
+   return
+fi
+
 repodirname=$AOMP_REPOS/rocmlibs/$reponame
 echo
 if [ -d $repodirname  ] ; then 

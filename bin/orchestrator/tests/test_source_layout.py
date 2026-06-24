@@ -42,6 +42,12 @@ def _init_repo(path, branch="amd-staging"):
 # therock compiler/amd-llvm, module name llvm-project, branch amd-staging).
 LLVM = next(c for c in source_layout.SHARED_COMPONENTS if c.aomp_dir == "llvm-project")
 
+# Monorepo-backed (symlink-only) components: one in rocm-systems (a top-level
+# AOMP repo dir) and one in rocm-libraries (under rocmlibs/).
+CLR = next(c for c in source_layout.SHARED_COMPONENTS if c.aomp_dir == "clr")
+ROCBLAS = next(c for c in source_layout.SHARED_COMPONENTS
+               if c.aomp_dir == "rocmlibs/rocBLAS")
+
 
 class SymlinkPlanTests(unittest.TestCase):
     def setUp(self):
@@ -93,6 +99,34 @@ class SymlinkPlanTests(unittest.TestCase):
         plan = source_layout.symlink_plan(self.aomp, self.therock)
         act = next(a for a in plan if a.comp is LLVM)
         self.assertEqual(act.status, "already-linked")
+
+    def test_link_monorepo_systems_subdir(self):
+        # A rocm-systems monorepo subproject symlinks like any other; the link
+        # lands at AOMP_REPOS/clr and resolves into the monorepo subdir.
+        self.assertTrue(CLR.symlink_only)
+        self.assertEqual(CLR.therock_path, "rocm-systems/projects/clr")
+        self._populate_target(CLR)
+        plan = source_layout.symlink_plan(self.aomp, self.therock)
+        act = next(a for a in plan if a.comp is CLR)
+        self.assertEqual(act.status, "link")
+        source_layout.apply_symlinks(plan)
+        link = os.path.join(self.aomp, "clr")
+        self.assertTrue(os.path.islink(link))
+        self.assertTrue(os.path.exists(os.path.join(link, "f")))
+
+    def test_link_monorepo_libraries_subdir(self):
+        # A rocm-libraries subproject lands under AOMP_REPOS/rocmlibs/<dir>; the
+        # parent rocmlibs/ dir is created by apply_symlinks.
+        self.assertTrue(ROCBLAS.symlink_only)
+        self.assertEqual(ROCBLAS.therock_path, "rocm-libraries/projects/rocblas")
+        self._populate_target(ROCBLAS)
+        plan = source_layout.symlink_plan(self.aomp, self.therock)
+        act = next(a for a in plan if a.comp is ROCBLAS)
+        self.assertEqual(act.status, "link")
+        source_layout.apply_symlinks(plan)
+        link = os.path.join(self.aomp, "rocmlibs", "rocBLAS")
+        self.assertTrue(os.path.islink(link))
+        self.assertTrue(os.path.exists(os.path.join(link, "f")))
 
 
 class MigratePlanTests(unittest.TestCase):
@@ -197,6 +231,26 @@ class MigratePlanTests(unittest.TestCase):
         self.assertTrue(os.path.exists(src))
         self.assertFalse(os.path.exists(os.path.join(self.therock,
                                                      LLVM.therock_path)))
+
+    def test_migrate_skips_symlink_only_components(self):
+        # Monorepo-backed components can't be migrated 1:1, so migrate_plan must
+        # never emit an action for them -- even when a matching standalone repo
+        # happens to exist in the AOMP checkout.
+        _init_repo(os.path.join(self.aomp, CLR.aomp_dir))
+        _init_repo(os.path.join(self.aomp, ROCBLAS.aomp_dir))
+        plan = source_layout.migrate_plan(self.therock, self.aomp)
+        planned = {a.comp.aomp_dir for a in plan}
+        self.assertNotIn(CLR.aomp_dir, planned)
+        self.assertNotIn(ROCBLAS.aomp_dir, planned)
+        # Only the standalone (non symlink-only) components are migratable.
+        self.assertTrue(
+            all(not a.comp.symlink_only for a in plan)
+        )
+        self.assertEqual(
+            {a.comp.aomp_dir for a in plan},
+            {c.aomp_dir for c in source_layout.SHARED_COMPONENTS
+             if not c.symlink_only},
+        )
 
 
 class RocmlibsDetectionTests(unittest.TestCase):

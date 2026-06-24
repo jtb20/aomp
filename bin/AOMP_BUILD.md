@@ -1012,12 +1012,14 @@ point onward. Deleting the `stamps/` directory also resets everything.
 ## Sharing sources between AOMP and TheRock
 
 AOMP keeps each component as its own standalone repo under `AOMP_REPOS`; TheRock
-keeps them as submodules of a single checkout. A handful of components are
-standalone git repos in *both* layouts and can therefore be shared 1:1. TheRock
-is treated as the canonical layout (AOMP builds move toward it, and it is mostly
-a superset).
+keeps them as submodules of a single checkout. TheRock is treated as the
+canonical layout (AOMP builds move toward it, and it is mostly a superset).
+Sharing comes in two tiers, defined by `SHARED_COMPONENTS` in
+[bin/orchestrator/source_layout.py](orchestrator/source_layout.py):
 
-The shared set (AOMP path → TheRock path, submodule name, expected branch):
+**Tier 1 — standalone repos in both layouts (symlink *and* migrate).** A handful
+of components are standalone git repos on both sides, so they can be both
+symlinked into an AOMP checkout and migrated 1:1 into TheRock's submodule slots:
 
 | AOMP `AOMP_REPOS/…`     | TheRock path                       | submodule              | branch                  |
 | ----------------------- | ---------------------------------- | ---------------------- | ----------------------- |
@@ -1031,10 +1033,46 @@ The shared set (AOMP path → TheRock path, submodule name, expected branch):
 `llvm-project` also backs AOMP's `project` / `comgr` / `hipcc` via subpaths, so
 those resolve through the single shared checkout.
 
-The monorepo-backed components (TheRock's `rocm-systems` / `rocm-libraries`
-submodules, which AOMP keeps as separate repos) are **not** in the 1:1 set and
-stay managed by `clone_aomp.sh` / `clone_rocmlibs.sh` (AOMP) and
-`fetch_sources.py` (TheRock).
+**Tier 2 — monorepo-backed components (symlink *only*).** Most remaining AOMP
+repos exist in TheRock too, but as a *subdirectory* of the `rocm-systems` /
+`rocm-libraries` monorepo submodule (or vendored under `third-party/`). A
+whole-repo directory symlink still works (the AOMP build then compiles whatever
+TheRock's monorepo checkout contains), but they **cannot be migrated** — you
+can't move a standalone AOMP repo into a slot the monorepo owns. So `--migrate-aomp`
+ignores them; only `--therock-symlinks` covers them.
+
+| AOMP `AOMP_REPOS/…`        | TheRock path                          |
+| -------------------------- | ------------------------------------- |
+| `amdsmi`                   | `rocm-systems/projects/amdsmi`        |
+| `clr`                      | `rocm-systems/projects/clr`           |
+| `hip`                      | `rocm-systems/projects/hip`           |
+| `ROCdbgapi`                | `rocm-systems/projects/rocdbgapi`     |
+| `rocminfo`                 | `rocm-systems/projects/rocminfo`      |
+| `rocm_smi_lib`             | `rocm-systems/projects/rocm-smi-lib`  |
+| `rocprofiler-register`     | `rocm-systems/projects/rocprofiler-register` |
+| `rocprofiler-sdk`          | `rocm-systems/projects/rocprofiler-sdk` |
+| `rocr-runtime`             | `rocm-systems/projects/rocr-runtime`  |
+| `rocmlibs/rccl`            | `rocm-systems/projects/rccl`          |
+| `rocmlibs/rocBLAS`         | `rocm-libraries/projects/rocblas`     |
+| `rocmlibs/rocPRIM`         | `rocm-libraries/projects/rocprim`     |
+| `rocmlibs/rocSPARSE`       | `rocm-libraries/projects/rocsparse`   |
+| `rocmlibs/rocSOLVER`       | `rocm-libraries/projects/rocsolver`   |
+| `rocmlibs/hipBLAS-common`  | `rocm-libraries/projects/hipblas-common` |
+| `rocmlibs/hipBLAS`         | `rocm-libraries/projects/hipblas`     |
+| `rocmlibs/rocRAND`         | `rocm-libraries/projects/rocrand`     |
+| `rocmlibs/hipRAND`         | `rocm-libraries/projects/hiprand`     |
+| `rocmlibs/hipSOLVER`       | `rocm-libraries/projects/hipsolver`   |
+| `simde`                    | `third-party/simde`                   |
+
+Note the target paths handle the casing/underscore differences
+(`ROCdbgapi`→`rocdbgapi`, `rocm_smi_lib`→`rocm-smi-lib`) and cross-repo placement
+(`rccl` lives in `rocm-systems`, not `rocm-libraries`). Consequences of sharing
+these: the AOMP build compiles TheRock's monorepo-pinned versions (the monorepos
+track `develop`, not AOMP's per-component branches), git fingerprints in the
+manifest resolve to the enclosing monorepo SHA, and AOMP's transient `patchrepo`
+edits apply to the shared tree (the same as the Tier 1 shared repos). Components
+with **no** TheRock counterpart (notably `hipfort`) stay AOMP-only and are always
+cloned.
 
 These provisioning steps run **once**, after component resolution and before any
 build work. `-s/--source` is always the **destination** root.
@@ -1050,12 +1088,13 @@ set includes any `rocmlibs` components, `rocmlibs/clone_rocmlibs.sh` is run too.
 
 ### `--therock-symlinks DIR` (AOMP)
 
-Provision `-s/--source` by **symlinking** the shared standalone repos from the
+Provision `-s/--source` by **symlinking** the shared repos (both tiers above —
+the standalone repos *and* the monorepo-subdir / vendored components) from the
 TheRock checkout `DIR`, then clone the remaining AOMP-only repos with
-`clone_aomp.sh` (which skips any dir that is already a symlink, so the canonical
-TheRock tree is never mutated by a clone/pull). Whole-repo directory symlinks are
-used (not a per-file shadow tree): git, edits and add/remove all resolve to the
-real repo.
+`clone_aomp.sh` / `clone_rocmlibs.sh` (both skip any dir that is already a
+symlink, so the canonical TheRock tree is never mutated by a clone/pull). Whole-repo
+directory symlinks are used (not a per-file shadow tree): git, edits and
+add/remove all resolve to the real repo.
 
 ```bash
 ./aomp_build.py -s ~/git/aomp --therock-symlinks ~/code/TheRock
