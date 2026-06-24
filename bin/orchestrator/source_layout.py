@@ -29,17 +29,29 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class SharedComponent:
-    """A component that is a standalone git repo in both layouts."""
+    """A component whose sources can be shared between the two layouts.
+
+    The 1:1 standalone components (``symlink_only=False``) are standalone git
+    repos in *both* layouts, so they can be both symlinked and migrated. The
+    monorepo-backed components (``symlink_only=True``) live inside TheRock's
+    ``rocm-systems`` / ``rocm-libraries`` monorepo submodules (or the vendored
+    ``third-party/simde``) as a subdirectory, so they can only be *symlinked*
+    (an AOMP build consuming TheRock's checked-out sources) -- never migrated,
+    since a standalone AOMP repo cannot be moved into a slot the monorepo owns.
+    For those, ``submodule_name``/``therock_branch`` name the enclosing monorepo
+    and are cosmetic (``migrate_plan`` skips them).
+    """
     aomp_dir: str        # path under AOMP_REPOS (e.g. "llvm-project", "rocmlibs/half")
     therock_path: str    # path under the TheRock checkout (the submodule working tree)
     submodule_name: str  # .gitmodules name == .git/modules/<name>
     therock_branch: str  # TheRock's expected submodule branch (for mismatch warnings)
+    symlink_only: bool = False  # monorepo-backed: shareable by symlink, not migrate
 
 
 # The canonical 1:1 set. llvm-project also backs AOMP's project/comgr/hipcc via
 # subpaths (llvm/, amd/comgr, amd/hipcc), which resolve through the single
 # directory symlink.
-SHARED_COMPONENTS: tuple[SharedComponent, ...] = (
+_STANDALONE_COMPONENTS: tuple[SharedComponent, ...] = (
     SharedComponent("llvm-project", "compiler/amd-llvm", "llvm-project", "amd-staging"),
     SharedComponent("rocm-cmake", "base/rocm-cmake", "rocm-cmake", "mainline"),
     SharedComponent("hipify", "compiler/hipify", "HIPIFY", "amd-staging"),
@@ -52,6 +64,65 @@ SHARED_COMPONENTS: tuple[SharedComponent, ...] = (
         "SPIRV-LLVM-Translator", "compiler/spirv-llvm-translator",
         "spirv-llvm-translator", "amd-staging",
     ),
+)
+
+
+def _systems(aomp_dir: str, project: str) -> SharedComponent:
+    """A rocm-systems monorepo subproject (symlink-only)."""
+    return SharedComponent(
+        aomp_dir, f"rocm-systems/projects/{project}", "rocm-systems", "develop",
+        symlink_only=True,
+    )
+
+
+def _libraries(aomp_dir: str, project: str) -> SharedComponent:
+    """A rocm-libraries monorepo subproject (symlink-only)."""
+    return SharedComponent(
+        aomp_dir, f"rocm-libraries/projects/{project}", "rocm-libraries",
+        "develop", symlink_only=True,
+    )
+
+
+# Monorepo-backed components: shareable into an AOMP checkout by symlink only
+# (the AOMP build then compiles whatever TheRock's monorepo checkout contains).
+# AOMP keeps each as a standalone repo dir; TheRock keeps it as a subdirectory
+# of the rocm-systems / rocm-libraries monorepo submodule (or vendored under
+# third-party/). Target paths are explicit, so per-component casing/underscore
+# differences (ROCdbgapi->rocdbgapi, rocm_smi_lib->rocm-smi-lib) and cross-repo
+# placement (rccl lives in rocm-systems, not rocm-libraries) are all handled.
+_MONOREPO_COMPONENTS: tuple[SharedComponent, ...] = (
+    # rocm-systems/projects/* (AOMP_REPOS/<dir>)
+    _systems("amdsmi", "amdsmi"),
+    _systems("clr", "clr"),
+    _systems("hip", "hip"),
+    _systems("ROCdbgapi", "rocdbgapi"),
+    _systems("rocminfo", "rocminfo"),
+    _systems("rocm_smi_lib", "rocm-smi-lib"),
+    _systems("rocprofiler-register", "rocprofiler-register"),
+    _systems("rocprofiler-sdk", "rocprofiler-sdk"),
+    _systems("rocr-runtime", "rocr-runtime"),
+    # rocm-libraries/projects/* (AOMP_REPOS/rocmlibs/<dir>); half is standalone.
+    _libraries("rocmlibs/rocBLAS", "rocblas"),
+    _libraries("rocmlibs/rocPRIM", "rocprim"),
+    _libraries("rocmlibs/rocSPARSE", "rocsparse"),
+    _libraries("rocmlibs/rocSOLVER", "rocsolver"),
+    _libraries("rocmlibs/hipBLAS-common", "hipblas-common"),
+    _libraries("rocmlibs/hipBLAS", "hipblas"),
+    _libraries("rocmlibs/rocRAND", "rocrand"),
+    _libraries("rocmlibs/hipRAND", "hiprand"),
+    _libraries("rocmlibs/hipSOLVER", "hipsolver"),
+    # rccl is a rocm-systems project despite AOMP filing it under rocmlibs/.
+    _systems("rocmlibs/rccl", "rccl"),
+    # Vendored third-party (not a submodule); sources still resolve through the
+    # symlink for an AOMP build.
+    SharedComponent(
+        "simde", "third-party/simde", "", "", symlink_only=True,
+    ),
+)
+
+
+SHARED_COMPONENTS: tuple[SharedComponent, ...] = (
+    _STANDALONE_COMPONENTS + _MONOREPO_COMPONENTS
 )
 
 
@@ -165,6 +236,11 @@ def migrate_plan(dest_therock_dir: str, aomp_repodir: str) -> list[MigrateAction
     git_dir = _git_out(dest_therock_dir, "rev-parse", "--absolute-git-dir")
     actions: list[MigrateAction] = []
     for comp in SHARED_COMPONENTS:
+        # Monorepo-backed components cannot be migrated 1:1 (their slot is owned
+        # by the rocm-systems / rocm-libraries monorepo submodule); they are
+        # shareable by symlink only. Skip them here.
+        if comp.symlink_only:
+            continue
         src = _abs(aomp_repodir, comp.aomp_dir)
         dest = _abs(dest_therock_dir, comp.therock_path)
         warnings: list[str] = []
