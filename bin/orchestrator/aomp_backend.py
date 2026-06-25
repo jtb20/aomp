@@ -131,9 +131,11 @@ class AompBackend(Backend):
 
     def __init__(self) -> None:
         self._cfg: Config | None = None
+        self._args: argparse.Namespace | None = None
 
     # --- configuration & environment ------------------------------------- #
     def load_config(self, args: argparse.Namespace) -> Config:
+        self._args = args
         self._cfg = parse_cudf(args.config)
         return self._cfg
 
@@ -256,6 +258,73 @@ class AompBackend(Backend):
             core._fail(f"missing build script for '{comp}': {script}")
         out = self._capture(script, ["list_configs"], env)
         return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def _list_configs_optional(
+        self, comp: str, env: dict[str, str]
+    ) -> list[str] | None:
+        """Advertised configs for a component, or None if the build script is
+        missing or its ``list_configs`` fails. Unlike component_configs (which
+        aborts the run), this tolerates failures so a whole-tree listing
+        (list-variants) skips a problematic component rather than dying."""
+        script = self._script_path(comp)
+        if not os.path.exists(script):
+            return None
+        proc = subprocess.run(
+            ["bash", script, "list_configs"],
+            capture_output=True, text=True, env=env,
+        )
+        if proc.returncode != 0:
+            return None
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    def list_features(self, env: dict[str, str]) -> list[dict] | None:
+        """Rows for the `list-features` selector.
+
+        For AOMP a "feature" is a CUDF component group (an --add/--remove
+        alias). This lists both the groups and the individual components, each
+        marked according to the *effective* build set -- the default request
+        adjusted by any --add/--remove on this command line. So an enabled row
+        is currently built (removable) and a disabled row is addable. Group rows
+        also carry their member components."""
+        assert self._cfg is not None
+        adds = getattr(self._args, "add", None) or []
+        removes = getattr(self._args, "remove", None) or []
+        effective = set(core.resolve_components(self._cfg, adds, removes))
+        rows: list[dict] = []
+        for name, members in self._cfg.features.items():
+            present = [m for m in members if m in effective]
+            rows.append({
+                "kind": "group",
+                "name": name,
+                "members": list(members),
+                "enabled": bool(members) and len(present) == len(members),
+                "present": len(present),
+                "total": len(members),
+            })
+        for name in self._cfg.packages:
+            rows.append({
+                "kind": "component",
+                "name": name,
+                "enabled": name in effective,
+            })
+        return rows
+
+    def list_variants(self, env: dict[str, str]) -> list[dict] | None:
+        """Rows for the `list-variants` selector: components that advertise a
+        non-default build variant, with the variants they offer.
+
+        Variants are advertised per-component by ``build_<comp>.sh
+        list_configs`` and are environment-gated (AOMP_BUILD_SANITIZER/_DEBUG/
+        _PERF), so the set reflects the current child environment. Components
+        offering only ``default`` (or whose script is unavailable) are
+        omitted."""
+        assert self._cfg is not None
+        rows: list[dict] = []
+        for comp in self._cfg.packages:
+            configs = self._list_configs_optional(comp, env)
+            if configs and configs != ["default"]:
+                rows.append({"component": comp, "variants": configs})
+        return rows
 
     def list_component_tasks(
         self, comp: str, env: dict[str, str]

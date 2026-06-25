@@ -118,7 +118,8 @@ aomp_build.py [options] [selector ...]
 | Option | Description |
 |--------|-------------|
 | `list` (selector) | Print the numbered task list and exit (`[NNN] [✓] component/stage`; the tick marks completed tasks, see [Completion stamps](#completion-stamps)). Trailing selectors preview a focused build: `list amd-llvm` marks every other already-built component `[pinned]` (TheRock only, see [Incremental focus](#incremental-focus-auto-pin-out-of-scope-components)). |
-| `list-features` (selector) | Print the backend's configurable features and exit (TheRock only: the `THEROCK_ENABLE_*` flags, with ✓/✗ enabled state). Enable one with `--add <name> --reconfigure`, disable one (cascading to dependents) with `--remove <name> --reconfigure`. |
+| `list-features` (selector) | Print the backend's configurable features and exit, with ✓/✗ enabled state. **TheRock:** the `THEROCK_ENABLE_*` flags; enable one with `--add <name> --reconfigure`, disable one (cascading to dependents) with `--remove <name> --reconfigure`. **AOMP:** the CUDF component groups *and* the individual components addable/removable via `--add`/`--remove`; ✓ means in the current build set (removable), ✗ means addable. The marks reflect the *effective* set, so they update if you pass `--add`/`--remove` on the same command line (a group whose members are only partly selected is shown as `partial: n/total`). |
+| `list-variants` (selector) | Print the components that advertise a non-default build variant and exit (AOMP only; TheRock subprojects are config-less). Select a variant with `--variant <cfg>` (all components) or `--variant <comp>=<cfg>` (one component); `default` is always built when offered. Advertised variants are environment-gated (`AOMP_BUILD_SANITIZER` / `AOMP_BUILD_DEBUG` / `AOMP_BUILD_PERF`), so set those (e.g. via `--pass-env`) to expose `asan`/`debug`/`perf`. |
 | `list-shards` (selector) | Print the backend's shard catalog and exit (TheRock only: the `BUILD_TOPOLOGY.toml` artifact groups, with their subprojects, dependency groups, and artifact counts). Drive one with `--import-shard` / `--build-shard` / `--export-shard(s)`. See [Sharding](#sharding). |
 | `list-configs` (selector) | Print the backend's source configs and exit (TheRock only: the branches each `-c/--config` selects, with the default marked). See [Source config](#source-config-which-sources-to-build-via--c--config). |
 | `-a`, `--all` | (TheRock only) Elaborate *every* advertised per-subproject action (`expunge/configure/build/stage/dist`) instead of the default `configure/build/stage`. Use with `list` to see the full capability set, or with a selector to run a normally-hidden action (e.g. `-a amd-llvm/expunge`). See [TheRock backend](#therock-backend). |
@@ -261,7 +262,8 @@ run. The grammar mirrors `amd-build`:
 |----------|---------|
 | *(none)* | Run all elaborated tasks. |
 | `list` | Print the numbered task list and exit (does not run anything). Trailing selectors preview a focused build, marking out-of-scope built components `[pinned]` (TheRock). |
-| `list-features` | Print the backend's configurable features and exit (TheRock: the `THEROCK_ENABLE_*` flags). Does not run anything. |
+| `list-features` | Print the backend's configurable features and exit (TheRock: the `THEROCK_ENABLE_*` flags; AOMP: the CUDF component groups + components for `--add`/`--remove`). Does not run anything. |
+| `list-variants` | Print components that advertise a non-default build variant and exit (AOMP only; select with `--variant`). Does not run anything. |
 | `list-shards` | Print the backend's shard catalog and exit (TheRock: the `BUILD_TOPOLOGY.toml` artifact groups). Does not run anything. |
 | `list-configs` | Print the backend's source configs and exit (TheRock: the branches each `-c/--config` selects). Does not run anything. |
 | `N` | Run task number `N` (1-based, as shown by `list`). |

@@ -120,6 +120,17 @@ class Backend(ABC):
         the TheRock backend lists its THEROCK_ENABLE_* features. Default: None."""
         return None
 
+    def list_variants(self, env: dict[str, str]) -> list[dict] | None:
+        """Rows for the `list-variants` selector, or None if the backend has no
+        build-variant concept.
+
+        Each row is a dict with 'component' and 'variants' (the advertised
+        non-default build configs the component supports). The AOMP backend
+        lists components whose build_<comp>.sh advertises more than the lone
+        'default' config; TheRock is config-less and returns None. Default:
+        None."""
+        return None
+
     def built_components(self, env: dict[str, str]) -> set[str] | None:
         """Components the backend considers already built (so they can be pinned
         / shown as done), or None if the backend has no such notion.

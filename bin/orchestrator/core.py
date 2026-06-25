@@ -397,6 +397,70 @@ def print_shard_catalog(rows: list[dict]) -> None:
         print()
 
 
+def _print_feature_rows(rows: list[dict]) -> None:
+    """Print the `list-features` catalog.
+
+    Two row shapes are supported. AOMP rows carry a "kind" ("group" or
+    "component") and are printed in two labelled sections with a built-by-
+    default mark (and group member lists); a check means the row is in the
+    current build set (removable), a cross means it is addable. Rows without a
+    "kind" use the flat TheRock formatting (name + requires + description)."""
+    if any("kind" in r for r in rows):
+        groups = [r for r in rows if r.get("kind") == "group"]
+        comps = [r for r in rows if r.get("kind") == "component"]
+        gwidth = max((len(r["name"]) for r in groups), default=0)
+        if groups:
+            print("Component groups (pass to --add / --remove):")
+            for r in groups:
+                mark = render_mark("done" if r["enabled"] else "incomplete")
+                line = f"  [{mark}] {r['name']:<{gwidth}}"
+                members = r.get("members") or []
+                if members:
+                    line += f"  -> {', '.join(members)}"
+                if r.get("partial") or (
+                    0 < r.get("present", 0) < r.get("total", 0)
+                ):
+                    line += f"  (partial: {r['present']}/{r['total']})"
+                print(line)
+            print()
+        if comps:
+            cwidth = max(len(r["name"]) for r in comps)
+            print("Components (pass to --add / --remove):")
+            for r in comps:
+                mark = render_mark("done" if r["enabled"] else "incomplete")
+                print(f"  [{mark}] {r['name']:<{cwidth}}")
+            print()
+        print("[\u2713] = in the current build set (removable);  "
+              "[\u2717] = not built (addable).")
+        return
+    width = max(len(r["name"]) for r in rows)
+    for r in rows:
+        mark = render_mark("done" if r["enabled"] else "incomplete")
+        line = f"[{mark}] {r['name']:<{width}}"
+        if r.get("requires"):
+            line += f"  requires: {', '.join(r['requires'])}"
+        if r.get("description"):
+            line += f"  - {r['description']}"
+        print(line)
+
+
+def print_variant_catalog(rows: list[dict]) -> None:
+    """Print the `list-variants` catalog: components advertising a non-default
+    build variant, one per line, with a short note on how variants are selected
+    and that the advertised set is environment-gated."""
+    print("Build variants are selected with --variant:")
+    print("  --variant <cfg>          apply to every component that offers it")
+    print("  --variant <comp>=<cfg>   apply only to that component")
+    print("'default' is always built when a component offers it, so e.g. "
+          "'--variant asan' builds default+asan.")
+    print("Advertised variants are environment-gated "
+          "(AOMP_BUILD_SANITIZER / AOMP_BUILD_DEBUG / AOMP_BUILD_PERF); set "
+          "them (e.g. via --pass-env) to expose asan/debug/perf.\n")
+    width = max(len(r["component"]) for r in rows)
+    for r in rows:
+        print(f"  {r['component']:<{width}}  {', '.join(r['variants'])}")
+
+
 # --------------------------------------------------------------------------- #
 # Execution
 # --------------------------------------------------------------------------- #
@@ -950,7 +1014,10 @@ def build_arg_parser(
             "  list          print the numbered task list and exit\n"
             "  list-features print the backend's configurable features and exit\n"
             "                  (TheRock: THEROCK_ENABLE_* features; enable one\n"
-            "                  with --add <name> --reconfigure)\n"
+            "                  with --add <name> --reconfigure. AOMP: CUDF\n"
+            "                  component groups + components for --add/--remove)\n"
+            "  list-variants print components with non-default build variants\n"
+            "                  and exit (AOMP only; select with --variant)\n"
             "  list-shards   print the backend's shard catalog and exit\n"
             "                  (TheRock: BUILD_TOPOLOGY.toml artifact groups;\n"
             "                  drive one with --import/build/export-shard)\n"
@@ -1275,8 +1342,10 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
 
     # `list-features` selector: print the backend's feature catalog and exit.
     # Same positional syntax as `list`; a green check marks an enabled feature,
-    # a red cross a disabled one (enable a disabled feature with --add <name>
-    # --reconfigure).
+    # a red cross a disabled one. For TheRock these are THEROCK_ENABLE_* toggles
+    # (enable with --add <name> --reconfigure); for AOMP they are the CUDF
+    # component groups plus the individual components addable/removable via
+    # --add/--remove (a check means it is in the current build set).
     if args.selectors and args.selectors[0] == "list-features":
         rows = backend.list_features(child_env)
         if rows is None:
@@ -1286,15 +1355,24 @@ def run(args: argparse.Namespace, backend: Backend) -> int:
             print(f"{PROG}: no features found "
                   f"(run with --reconfigure to generate the feature catalog)")
             return 0
-        width = max(len(r["name"]) for r in rows)
-        for r in rows:
-            mark = render_mark("done" if r["enabled"] else "incomplete")
-            line = f"[{mark}] {r['name']:<{width}}"
-            if r.get("requires"):
-                line += f"  requires: {', '.join(r['requires'])}"
-            if r.get("description"):
-                line += f"  - {r['description']}"
-            print(line)
+        _print_feature_rows(rows)
+        return 0
+
+    # `list-variants` selector: print the components that advertise a
+    # non-default build variant and how to select them. AOMP only (TheRock
+    # subprojects are config-less).
+    if args.selectors and args.selectors[0] == "list-variants":
+        rows = backend.list_variants(child_env)
+        if rows is None:
+            print(f"{PROG}: this backend has no build-variant concept")
+            return 0
+        if not rows:
+            print(f"{PROG}: no components advertise non-default variants "
+                  f"(variants are environment-gated; e.g. set "
+                  f"AOMP_BUILD_SANITIZER=1 and pass it with --pass-env to "
+                  f"expose 'asan').")
+            return 0
+        print_variant_catalog(rows)
         return 0
 
     # `list-shards` selector: print the backend's shard catalog (TheRock
