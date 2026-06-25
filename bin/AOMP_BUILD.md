@@ -683,6 +683,34 @@ TheRock subprojects are config-less (a single configuration is baked in at
 configure time), so tasks use the short `subproject/stage` names and the
 `--variant` filter does not apply.
 
+#### Incremental builds (in-subproject-dir delegation)
+
+TheRock's super-project tracks subproject freshness with stamp files and does
+**not** re-scan a subproject's own sources, so for large components (e.g.
+`amd-llvm`) a super-level `ninja <subproject>+build` can miss local source
+edits and skip the rebuild. To avoid this, once a subproject has been
+configured (its own `build/build.ninja` exists), the backend runs the **`build`
+stage directly in that subproject's build directory**:
+
+```
+ninja -C <build>/<subproject path>/build      # instead of ninja <subproject>+build
+```
+
+The subproject's own `build.ninja` has correct per-file dependency tracking, so
+edits are detected and rebuilt (this is TheRock's ["Option
+1"](https://github.com/ROCm/TheRock/blob/main/docs/development/development_guide.md)
+developer flow). The in-dir build also triggers the subproject's `therock-touch`
+target, which marks its `stage.stamp` stale, so the following `<subproject>+stage`
+re-stages and the new output propagates to the combined dist/install tree —
+no extra step is needed.
+
+This is on by default and only affects the `build` stage (`configure` and
+`stage` still run at the super level). Before the first configure of a
+subproject there is no `build.ninja`, so the build falls back to
+`ninja <subproject>+build` automatically. Pass **`--superproject-build`** to
+force the super-level `ninja <subproject>+build` in all cases (e.g. to recover
+from a half-configured subproject build dir).
+
 ### Default request set (match the native build)
 
 The introspection map declares **every** subproject TheRock knows about,

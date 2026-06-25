@@ -759,6 +759,86 @@ class DefaultRequestTest(unittest.TestCase):
         self.assertIn("therock-boost", components)
 
 
+class BuildDelegationTest(unittest.TestCase):
+    """The 'build' stage delegates to in-subproject-dir ninja once configured.
+
+    TheRock "Option 1": once a subproject's own build.ninja exists, building it
+    runs `ninja -C <subproject build dir>` (which detects source edits the
+    super-project's stamp tracking misses) instead of `ninja <comp>+build`.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-delegate-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _task(self, backend, args, name: str):
+        env = backend.build_child_env(args)
+        cfg = backend.load_config(args)
+        components = core.resolve_components(cfg, args.add, args.remove)
+        tasks = core.elaborate_tasks(backend, cfg, components, env, [], {})
+        return next(t for t in tasks if t.name == name), env
+
+    def _make_build_ninja(self, comp: str) -> str:
+        sub_dir = os.path.join(self.build, FIXTURE[comp]["bin"])
+        os.makedirs(sub_dir, exist_ok=True)
+        with open(os.path.join(sub_dir, "build.ninja"), "w") as fh:
+            fh.write("# fake\n")
+        return sub_dir
+
+    def test_build_without_ninja_uses_superlevel(self) -> None:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        task, env = self._task(backend, args, "amd-llvm/build")
+        cmd, _ = backend.task_command(task, env)
+        self.assertEqual(cmd, ["ninja", "-C", self.build, "amd-llvm+build"])
+
+    def test_build_with_ninja_delegates_to_subdir(self) -> None:
+        sub_dir = self._make_build_ninja("amd-llvm")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        task, env = self._task(backend, args, "amd-llvm/build")
+        cmd, _ = backend.task_command(task, env)
+        self.assertEqual(cmd, ["ninja", "-C", sub_dir])
+        self.assertNotIn("amd-llvm+build", cmd)
+
+    def test_superproject_build_flag_disables_delegation(self) -> None:
+        self._make_build_ninja("amd-llvm")
+        backend = TheRockBackend()
+        args = make_args(
+            self.therock, self.repos, "--superproject-build", "list",
+        )
+        task, env = self._task(backend, args, "amd-llvm/build")
+        cmd, _ = backend.task_command(task, env)
+        self.assertEqual(cmd, ["ninja", "-C", self.build, "amd-llvm+build"])
+
+    def test_configure_and_stage_never_delegate(self) -> None:
+        # Even with build.ninja present, only the build stage delegates.
+        self._make_build_ninja("amd-llvm")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "list")
+        for stage, target in (("configure", "amd-llvm+configure"),
+                               ("stage", "amd-llvm+stage")):
+            task, env = self._task(backend, args, f"amd-llvm/{stage}")
+            cmd, _ = backend.task_command(task, env)
+            self.assertEqual(cmd, ["ninja", "-C", self.build, target])
+
+    def test_delegated_build_appends_jobs(self) -> None:
+        sub_dir = self._make_build_ninja("amd-llvm")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "-j", "8", "list")
+        task, env = self._task(backend, args, "amd-llvm/build")
+        cmd, _ = backend.task_command(task, env)
+        self.assertEqual(cmd, ["ninja", "-C", sub_dir, "-j", "8"])
+
+
 class FeatureSelectionTest(unittest.TestCase):
     """THEROCK_ENABLE_* feature selection via --add + the feature catalog."""
 
