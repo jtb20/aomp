@@ -1315,6 +1315,24 @@ class TheRockBackend(Backend):
             return list(argv), {}
         bin_dir = task.payload["bin"]
         target = task.payload["target"]
+        # TheRock "Option 1": for the per-subproject build stage, once the
+        # subproject has been configured (its own build.ninja exists), run ninja
+        # directly in that build dir. The super-level `<comp>+build` relies on
+        # stamp tracking that does not re-scan a subproject's sources, so edits
+        # to large components (e.g. amd-llvm) are otherwise not rebuilt. The
+        # subproject's `therock-touch` ALL target then marks stage.stamp stale,
+        # so the following `<comp>+stage` re-stages. Opt out with
+        # --superproject-build.
+        delegate = self._args is None or getattr(self._args, "delegate", True)
+        if delegate and task.action == "build":
+            sub_bin = self._meta.get(task.comp, {}).get("bin", "")
+            if sub_bin:
+                sub_dir = os.path.join(bin_dir, sub_bin)
+                if os.path.isfile(os.path.join(sub_dir, "build.ninja")):
+                    cmd = ["ninja", "-C", sub_dir]
+                    if self._args is not None and self._args.jobs is not None:
+                        cmd += ["-j", str(self._args.jobs)]
+                    return cmd, {}
         cmd = ["ninja", "-C", bin_dir, target]
         if self._args is not None and self._args.jobs is not None:
             cmd += ["-j", str(self._args.jobs)]

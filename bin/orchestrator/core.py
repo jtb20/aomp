@@ -1101,6 +1101,17 @@ def add_backend_options(
              "component is buildable again, then proceed normally.",
     )
     group.add_argument(
+        "--superproject-build", dest="delegate", action="store_false",
+        default=True,
+        help="for the per-subproject 'build' stage, always run the super-level "
+             "`ninja <comp>+build` instead of running ninja directly in the "
+             "subproject's build dir. By default, once a subproject has been "
+             "configured (its build/build.ninja exists), its build runs in-dir "
+             "so local source edits are detected (TheRock 'Option 1'); the "
+             "super-project's stamp tracking can otherwise miss them for large "
+             "components.",
+    )
+    group.add_argument(
         "-a", "--all", action="store_true",
         help="elaborate every advertised per-component action "
              "(expunge/configure/build/stage/dist) instead of just the default "
