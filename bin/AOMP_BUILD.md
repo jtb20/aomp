@@ -861,9 +861,11 @@ therock_build.py --build-tests --reconfigure prim/build
 ```
 
 Because it is a configure-time gate, `--build-tests` only takes hold on a
-(re)configure, and the flag is re-emitted on every configure (a reconfigure wipes
-the build dir, so an unrepeated value would silently revert to TheRock's ON
-default). Flipping the setting on an already-configured tree therefore needs
+(re)configure, and the flag is re-emitted on every configure — so the setting
+follows the command line rather than whatever the cmake cache happens to carry,
+and survives the configures that do start from an empty build dir
+(`--fresh-configure`, a source switch). Flipping the setting on an
+already-configured tree therefore needs
 `--reconfigure`; asking for a flip without it is a hard error rather than a silent
 no-op, in both directions — dropping `--build-tests` from a tree configured *with*
 tests turns them off, which is just as much a change as adding it:
@@ -882,9 +884,9 @@ The comparison is against `THEROCK_BUILD_TESTING` in the **current
 `CMakeCache.txt`**, and a tree where that variable is absent is left *unmanaged*
 (same treatment `--build-type` gives a scope it did not set). So a tree configured
 straight from `setup_srock.sh`, or before this option existed, keeps building tests
-without complaint — the off-by-default only takes hold at its next configure. That
-avoids demanding a `--reconfigure`, which wipes the build dir, just to stop
-building tests the tree was already building.
+without complaint — the off-by-default only takes hold at its next configure,
+rather than every invocation failing until you spend a configure to stop building
+tests the tree was already building.
 
 Note that individual libraries also have their own upstream `BUILD_TEST`-style
 options; `--build-tests` drives TheRock's umbrella variable, which is what those
@@ -990,11 +992,52 @@ than reimplemented, so the orchestrator and the two-script srock workflow stay
 consistent.
 
 - If a `subproject_map.json` already exists, it is used as-is.
-- `--reconfigure` forces a fresh configure (with `-DTHEROCK_INTROSPECTION=ON`)
-  via `setup_srock.sh`, regenerating the map.
+- `--reconfigure` forces a configure (with `-DTHEROCK_INTROSPECTION=ON`) via
+  `setup_srock.sh restart`, regenerating the map.
 - A missing map without `--reconfigure` is a hard error with guidance — the
   heavy clone/fetch/configure is never triggered implicitly by a `list` or
   dry-run.
+
+#### Reconfiguring in place vs. from scratch
+
+`--reconfigure` reconfigures **in place**: TheRock's build dir is kept and cmake is
+re-run over it, which is the workflow cmake is built for. That matters because
+essentially all incremental state lives *inside* the build dir — every subproject's
+build and `stage/` dir, the `stage.prebuilt` markers behind
+[auto-pin](#incremental-focus-auto-pin-out-of-scope-components) and
+[`--import-shard`](#group-based-sharding), and the assembled `dist/` tree. Removing
+it means rebuilding the whole tree, which for a debug compiler runs into days; a
+configure-time change such as `--build-tests` or `--remove <feature>` does not
+warrant that.
+
+Use **`--fresh-configure`** (which implies `--reconfigure`) when you want the old
+from-scratch behavior: it removes the build dir first, so the configuration is
+derived only from the current command line. Reach for it for CI/release
+repeatability, or to recover a build dir whose state has gone bad.
+
+The trade-off is ordinary cmake cache semantics: an in-place configure keeps any
+cache entry the new configure does not set, so the result is a function of the
+tree's history and not just of your arguments. The orchestrator narrows that to
+almost nothing by re-stating everything it manages on *every* configure — install
+prefix, targets/families, `THEROCK_BUNDLE_SYSDEPS`, `THEROCK_BUILD_TESTING`, the
+`SROCK_CONFIG` feature block and any managed build types. What genuinely persists
+is anything you passed ad hoc via `SROCK_CMAKE_EXTRA` in an earlier run, and
+`--add <feature>` enables from earlier runs (which is usually what you want:
+feature choices now accumulate instead of being reset by the next reconfigure).
+
+Two cases still start from an empty build dir, because reusing it would be wrong or
+was explicitly requested:
+
+| Situation | Build dir |
+|---|---|
+| `--reconfigure` | kept; cmake reconfigures in place |
+| `--fresh-configure` | removed first |
+| [Source-config switch](#source-config-which-sources-to-build-via--c--config) (`-c`) | removed; it described the pre-switch branches and patch set |
+
+Because a switch already discards it, `--fresh-configure` combined with a switch
+does not remove it twice. The same split is available to the two-script srock
+workflow directly: `setup_srock.sh restart` reuses the build dir, and
+`setup_srock.sh restart clean` removes it.
 
 The build is controlled by the same `SROCK_*` conventions as the srock scripts:
 `SROCK_REPOS` (set by `-s`), the install dir / symlink (`-i` → `SROCK_LINK`),

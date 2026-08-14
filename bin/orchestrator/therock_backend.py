@@ -568,7 +568,8 @@ class TheRockBackend(Backend):
         """Validate requested feature enables/disables and, under --reconfigure,
         append their -DTHEROCK_ENABLE_<X>=ON/OFF flags to SROCK_CMAKE_EXTRA so the
         (re)configure picks them up. Without --reconfigure, changing a feature's
-        current state is a hard error (a reconfigure would wipe build/)."""
+        current state is a hard error: nothing would configure the tree, so the
+        request would be silently ignored."""
         catalog = self._read_feature_map(
             os.path.join(info["BUILD_DIR"], FEATURE_MAP)
         )
@@ -732,10 +733,12 @@ class TheRockBackend(Backend):
         # Component test suites (THEROCK_BUILD_TESTING). Default OFF -- see
         # DEFAULT_BUILD_TESTING -- and opt in with --build-tests. Emitted in both
         # directions like the sysdeps toggle above, which matters more here
-        # because TheRock's own default is ON *and* a reconfigure wipes build/
-        # (setup_srock.sh restart): a value not passed on every configure would
-        # silently revert to enabling tests. Only a (re)configure applies it, so
-        # a flip without --reconfigure is rejected (_assert_build_testing_ok).
+        # because TheRock's own default is ON: passing it every time makes the
+        # setting a function of the command line rather than of whatever the cmake
+        # cache carries, and keeps it across the configures that do start from an
+        # empty build dir (--fresh-configure, a source switch). Only a
+        # (re)configure applies it, so a flip without --reconfigure is rejected
+        # (_assert_build_testing_ok).
         testing = "ON" if _wants_build_tests(args) else "OFF"
         extra = env.get("SROCK_CMAKE_EXTRA", "")
         env["SROCK_CMAKE_EXTRA"] = (
@@ -853,9 +856,9 @@ class TheRockBackend(Backend):
         setup_srock.sh, or before this option existed -- and so runs on TheRock's
         own default (ON, via CTest's BUILD_TESTING). Such trees are deliberately
         left alone instead of being reported as a change: their tests were being
-        built all along, whereas turning them off would demand a --reconfigure,
-        which wipes the build dir. The default takes hold at their next
-        configure, like any other unmanaged cmake setting."""
+        built all along, so failing every invocation until the user reconfigures
+        would cost them a configure to fix nothing. The default takes hold at
+        their next configure, like any other unmanaged cmake setting."""
         path = os.path.join(build_dir, "CMakeCache.txt")
         try:
             with open(path, encoding="utf-8") as handle:
@@ -974,7 +977,10 @@ class TheRockBackend(Backend):
         """
         build_dir = info["BUILD_DIR"]
         json_path = os.path.join(build_dir, SUBPROJECT_MAP)
-        reconfigure = bool(getattr(self._args, "reconfigure", False))
+        # --fresh-configure is --reconfigure plus removing the build dir, so it
+        # implies one.
+        fresh = bool(getattr(self._args, "fresh_configure", False))
+        reconfigure = bool(getattr(self._args, "reconfigure", False)) or fresh
 
         # Detect a source-config switch: the shared checkout is reused across
         # source configs, so if it does not already reflect the requested config
@@ -1081,14 +1087,29 @@ class TheRockBackend(Backend):
         self._inject_introspection(therock_dir)
 
         # Reconfigure (reusing fetched sources) now that introspection is wired
-        # in and -DTHEROCK_INTROSPECTION=ON is passed.
+        # in and -DTHEROCK_INTROSPECTION=ON is passed. `restart` reconfigures in
+        # place; `restart clean` removes the build dir first. Only --fresh-
+        # configure asks for the latter, and only when something is left to
+        # remove: a first-ever setup starts from nothing, and a source switch has
+        # already discarded the build dir (it described the pre-switch sources).
+        restart = ["bash", SETUP_SROCK, "restart"]
+        if fresh and not switch_needed and os.path.isdir(build_dir):
+            restart.append("clean")
         print(
             f"{core.PROG}: reconfiguring TheRock with introspection: "
-            f"{SETUP_SROCK} restart", flush=True,
+            f"{' '.join(restart[1:])}", flush=True,
         )
-        rc = subprocess.run(
-            ["bash", SETUP_SROCK, "restart"], env=run_env
-        ).returncode
+        # Reconfiguring in place keeps the previous configure's map, so "the file
+        # exists" would no longer prove this configure produced it -- a configure
+        # that succeeded without running the introspection would leave us building
+        # against a stale graph. Drop the map first so its presence afterwards is
+        # proof. It is a generated file, and a configure that fails to write it is
+        # a hard error either way.
+        try:
+            os.remove(json_path)
+        except OSError:
+            pass
+        rc = subprocess.run(restart, env=run_env).returncode
         if rc != 0:
             core._fail(f"TheRock configure failed (rc={rc})")
         if not os.path.isfile(json_path):

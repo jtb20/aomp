@@ -1146,9 +1146,20 @@ def add_backend_options(
     group = parser.add_argument_group("TheRock backend (--backend therock)")
     group.add_argument(
         "--reconfigure", action="store_true",
-        help="force a fresh TheRock cmake configure (with "
+        help="force a TheRock cmake configure (with "
              "-DTHEROCK_INTROSPECTION=ON) to regenerate subproject_map.json, "
-             "even if a cached one exists.",
+             "even if a cached one exists. Reconfigures in place, keeping the "
+             "build dir (and so all built objects, stage dirs and prebuilt "
+             "markers).",
+    )
+    group.add_argument(
+        "--fresh-configure", action="store_true",
+        help="stronger --reconfigure (which it implies): remove TheRock's build "
+             "dir first, so the configuration is derived only from this command "
+             "line and nothing carries over in the cmake cache. Discards every "
+             "built object, stage dir and prebuilt marker, i.e. the next build "
+             "starts from scratch -- for CI/release repeatability or to recover "
+             "a build dir whose state has gone bad.",
     )
     group.add_argument(
         "--therock-dir", default=None, metavar="DIR",

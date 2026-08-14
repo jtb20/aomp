@@ -187,6 +187,19 @@ fi
 declare -a _cmake_enable
 _cmake_enable=()
 
+# Every config below states each of THEROCK_ENABLE_MIOPEN,
+# THEROCK_ENABLE_COMPOSABLE_KERNEL, THEROCK_ENABLE_FFT and THEROCK_BUNDLE_SYSDEPS
+# explicitly, even where it only restates what THEROCK_ENABLE_ALL implies.  These
+# are the toggles the configs disagree about, and setup_srock.sh restart
+# reconfigures over the existing cmake cache: a value a config leaves unset keeps
+# whatever the previous configure left behind.  Without the restatement,
+# switching SROCK_CONFIG from "all" to "all-debug" would inherit "all"'s OFFs and
+# quietly build the same set as "all".
+#
+# The remaining THEROCK_ENABLE_* below need no such treatment: they are only ever
+# set ON, by "minimal", and the "all" configs enable them anyway via
+# THEROCK_ENABLE_ALL, so a stale value cannot contradict the requested config.
+
 # This TheRock config is full build minus failing components
 if [ "$SROCK_CONFIG" == "all" ] ; then
    _cmake_enable=("${_cmake_enable[@]}"
@@ -194,19 +207,27 @@ if [ "$SROCK_CONFIG" == "all" ] ; then
       -DTHEROCK_ENABLE_MIOPEN=OFF
       -DTHEROCK_ENABLE_COMPOSABLE_KERNEL=OFF
       -DTHEROCK_ENABLE_FFT=OFF
+      -DTHEROCK_BUNDLE_SYSDEPS=OFF
    )
 fi
 
 # This is full build which could include failing components
 if [ "$SROCK_CONFIG" == "all-debug" ] ; then
    _cmake_enable=("${_cmake_enable[@]}"
-	   -DTHEROCK_ENABLE_ALL=ON )
+	   -DTHEROCK_ENABLE_ALL=ON
+	   -DTHEROCK_ENABLE_MIOPEN=ON
+	   -DTHEROCK_ENABLE_COMPOSABLE_KERNEL=ON
+	   -DTHEROCK_ENABLE_FFT=ON
+	   -DTHEROCK_BUNDLE_SYSDEPS=OFF )
 fi
 
 # Default is minimal for compiler developers
 if [ "$SROCK_CONFIG" == "minimal" ] ; then
    _cmake_enable=("${_cmake_enable[@]}"
       -DTHEROCK_ENABLE_ALL=OFF
+      -DTHEROCK_ENABLE_MIOPEN=OFF
+      -DTHEROCK_ENABLE_COMPOSABLE_KERNEL=OFF
+      -DTHEROCK_ENABLE_FFT=OFF
       -DTHEROCK_ENABLE_HIP_RUNTIME=ON
       -DTHEROCK_ENABLE_HIPIFY=ON
       -DTHEROCK_BUNDLE_SYSDEPS=ON

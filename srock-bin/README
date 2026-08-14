@@ -67,6 +67,18 @@ A: YES, with the 'restart' option.  If you want to start from scratch, including
    is /work/$USER/git/srock-repos/TheRock.  To reconfigure with existing
    downloaded sources instead, use "setup_srock.sh restart".
 
+Q: Does "setup_srock.sh restart" throw away my build ?
+A: NO.  It reuses the build directory and lets cmake reconfigure in place, so
+   compiled objects, each component's stage directory and any stage.prebuilt
+   markers survive; only what actually changed gets rebuilt afterwards.  Add
+   'clean' -- "setup_srock.sh restart clean" -- to remove the build directory and
+   configure from scratch, which is what you want for a release/CI build or to
+   recover a build directory whose state has gone bad.  Note that reconfiguring in
+   place keeps cmake cache values that the new configure does not set, so 'clean'
+   is the way to guarantee the configuration comes only from the current settings.
+   A source-config switch (a different SROCK_THEROCK_BRANCH) removes the build
+   directory automatically, since it describes sources that are no longer there.
+
 Q: Can one rerun build_srock.sh ?
 A: YES.  This is useful if you have made development changes to any repository.
    Naturally, this is much faster the 2nd time following setup_srock.sh

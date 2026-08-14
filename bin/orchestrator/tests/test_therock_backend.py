@@ -442,6 +442,10 @@ class SourceConfigSwitchTest(unittest.TestCase):
         def dispatch(cmd, *a, **kw):
             if cmd[:1] == ["git"]:
                 return real_run(cmd, *a, **kw)
+            # The real configure rewrites the introspection map; the backend
+            # requires that, so a stale map cannot pass for a fresh one.
+            with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+                json.dump(FIXTURE, fh)
             return mock.Mock(returncode=0)
 
         buf = io.StringIO()
@@ -509,6 +513,10 @@ class SourceConfigSwitchTest(unittest.TestCase):
             # Let real git queries through; mock the heavy reconfigure (bash).
             if cmd[:1] == ["git"]:
                 return real_run(cmd, *a, **kw)
+            # The real configure writes the introspection map, which the backend
+            # removes beforehand and requires afterwards.
+            with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+                json.dump(FIXTURE, fh)
             return mock.Mock(returncode=0)
 
         buf = io.StringIO()
@@ -674,6 +682,105 @@ class SourceConfigSwitchTest(unittest.TestCase):
         self.assertFalse(
             any(c.args[0][:1] == ["bash"] for c in run.call_args_list)
         )
+
+
+class ReconfigureModeTest(unittest.TestCase):
+    """--reconfigure reconfigures in place (`setup_srock.sh restart`), keeping the
+    build dir and everything incremental in it; --fresh-configure asks for it to be
+    removed first (`restart clean`)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-recfg-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(os.path.join(self.therock, "cmake"))
+        os.makedirs(self.build)
+        with open(os.path.join(self.therock, "CMakeLists.txt"), "w") as fh:
+            fh.write("# fixture\n")
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+        self.marker = os.path.join(self.therock, ".srock-source-config")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _restarts(self, *flags: str) -> list[list[str]]:
+        """The setup_srock.sh command lines load_config would run."""
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, *flags, "list")
+        # Cache the (real) env discovery so the mock only sees the reconfigure.
+        backend.discover_env(backend.build_child_env(args))
+        from unittest import mock
+        real_run = therock_backend.subprocess.run
+
+        def dispatch(cmd, *a, **kw):
+            if cmd[:1] == ["git"]:  # let the switch safety scan run for real
+                return real_run(cmd, *a, **kw)
+            # Stand in for the configure: it rewrites the introspection map, which
+            # the backend checks to prove the map is not from an earlier one.
+            self._touch_map()
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(therock_backend.subprocess, "run",
+                               side_effect=dispatch) as run, \
+                redirect_stdout(io.StringIO()):
+            backend.load_config(args)
+        return [c.args[0] for c in run.call_args_list if c.args[0][:1] == ["bash"]]
+
+    def _touch_map(self) -> None:
+        os.makedirs(self.build, exist_ok=True)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+
+    def test_reconfigure_is_in_place(self) -> None:
+        with open(self.marker, "w") as fh:
+            fh.write("amd-staging\n")  # matches the default -> no switch
+        calls = self._restarts("--reconfigure")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-1], "restart")
+        self.assertNotIn("clean", calls[0])
+
+    def test_fresh_configure_asks_for_a_clean_build_dir(self) -> None:
+        with open(self.marker, "w") as fh:
+            fh.write("amd-staging\n")
+        # No --reconfigure: --fresh-configure implies it.
+        calls = self._restarts("--fresh-configure")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-2:], ["restart", "clean"])
+
+    def test_switch_is_not_cleaned_twice(self) -> None:
+        # A source switch already discards the build dir (it described the
+        # pre-switch sources), so the follow-up configure must not ask again --
+        # that would throw away the configure the switch just did.
+        with open(self.marker, "w") as fh:
+            fh.write("develop\n")  # forces a switch to the default amd-staging
+        calls = self._restarts("--fresh-configure")
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertNotIn("clean", call)
+
+    def test_no_reconfigure_runs_nothing(self) -> None:
+        with open(self.marker, "w") as fh:
+            fh.write("amd-staging\n")
+        self.assertEqual(self._restarts(), [])
+
+    def test_configure_that_leaves_a_stale_map_is_an_error(self) -> None:
+        # Reusing the build dir means the previous map is still there, so a
+        # configure that succeeded without running the introspection must not pass
+        # for a fresh one (that would build against an outdated graph). This mock
+        # deliberately does not write the map.
+        with open(self.marker, "w") as fh:
+            fh.write("amd-staging\n")
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, "--reconfigure", "list")
+        backend.discover_env(backend.build_child_env(args))
+        from unittest import mock
+        with mock.patch.object(therock_backend.subprocess, "run",
+                              return_value=mock.Mock(returncode=0)), \
+                redirect_stdout(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            backend.load_config(args)
 
 
 class DefaultRequestTest(unittest.TestCase):

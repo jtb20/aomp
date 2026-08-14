@@ -14,9 +14,18 @@ thisdir=$(dirname "$realpath")
 # --- end standard header ----
 #
 
-# Accept a single command as an argument.  Only "restart" is accepted so far.
+# Accept a command as the first argument.  Only "restart" is accepted so far:
+# reconfigure with the existing sources, reusing the existing build directory
+# (cmake is designed to be re-run over one).  An optional second argument,
+# "clean", removes the build directory first for a guaranteed-fresh configure.
 ARG=$1
+ARG2=$2
 export _build_srock_mode="$ARG"
+
+if [ -n "$ARG2" ] && [ "$ARG2" != "clean" ]; then
+   echo " ERROR: unrecognized second argument '$ARG2' (expected 'clean')"
+   exit 1
+fi
 
 # Set to 1 below when an existing checkout's super-repo branch differs from the
 # requested SROCK_THEROCK_BRANCH (a source-config switch, e.g. amd-staging <->
@@ -28,7 +37,8 @@ if [ -d "$SROCK_THEROCK_DIR" ] && [ "$ARG" != "restart" ]; then
    echo " ERROR:  $0 requires that $SROCK_THEROCK_DIR NOT exist"
    echo "         Delete or move that directory to run $0"
    echo "         Alternatively, try '$0 restart' to reconfigure with"
-   echo "         existing sources."
+   echo "         existing sources, reusing the build dir ('$0 restart clean'"
+   echo "         to remove the build dir and configure from scratch)."
    exit 1
 fi
 
@@ -105,15 +115,42 @@ if [ "$ARG" != "restart" ] || [ "$_do_branch_switch" = 1 ]; then
    echo "=====  Done running python ./build_tools/fetch_sources.py"
 fi
 
+# Build directory handling for "restart".  The default is an in-place cmake
+# reconfigure, keeping the build dir: object files, each subproject's own build
+# and stage dirs, TheRock's stage.prebuilt markers and any imported artifacts all
+# survive.  Removing it means rebuilding everything from scratch -- upwards of a
+# day for a debug compiler -- which a reconfigure does not require.
+#
+# It is removed only when reuse would be unsound, or when explicitly requested:
+#   * a source-config switch: the checkout above moved to different branches and a
+#     different patch set, so the existing build state describes sources that are
+#     no longer there.
+#   * "restart clean": the caller wants a configure that inherits nothing (CI and
+#     release builds, or recovering a build dir whose state has gone bad).  Note
+#     that an in-place reconfigure keeps cache entries this run does not set, so
+#     this is the way to guarantee the configuration comes only from the current
+#     arguments.
 if [ "$ARG" = "restart" ]; then
-   echo "==== Removing build dir for restart ====="
-   echo "rm -rf $SROCK_THEROCK_DIR/build"
-   rm -rf "$SROCK_THEROCK_DIR/build"
+   if [ "$_do_branch_switch" = 1 ]; then
+      echo "==== Removing build dir: it describes the pre-switch sources ====="
+      echo "rm -rf $SROCK_THEROCK_DIR/build"
+      rm -rf "$SROCK_THEROCK_DIR/build"
+   elif [ "$ARG2" = "clean" ]; then
+      echo "==== Removing build dir for clean restart ====="
+      echo "rm -rf $SROCK_THEROCK_DIR/build"
+      rm -rf "$SROCK_THEROCK_DIR/build"
+   elif [ -d "$SROCK_THEROCK_DIR/build" ]; then
+      echo "==== Reusing build dir (cmake reconfigures in place) ====="
+      echo "     $SROCK_THEROCK_DIR/build"
+      echo "     Run '$0 restart clean' to configure from scratch instead."
+   fi
 fi
 
 echo "cd $SROCK_THEROCK_DIR" 
 cd "$SROCK_THEROCK_DIR" || exit
-[ -d build ] && echo "WARNING build directory $SROCK_THEROCK_DIR/build should not exist "
+if [ "$ARG" != "restart" ] && [ -d build ]; then
+   echo "WARNING build directory $SROCK_THEROCK_DIR/build should not exist "
+fi
 
 echo 
 echo "===== Running build_tools/setup_ccache.py"
