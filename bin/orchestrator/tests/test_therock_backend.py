@@ -1134,6 +1134,98 @@ class BuildTypeTest(unittest.TestCase):
         self.assertIn("not a known subproject", buf.getvalue())
 
 
+class BuildTestingTest(unittest.TestCase):
+    """--build-tests -> THEROCK_BUILD_TESTING: off by default, and flipping an
+    already-configured tree requires --reconfigure."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="therock-bts-")
+        self.repos = os.path.join(self.tmp, "repos")
+        self.therock = os.path.join(self.repos, "TheRock")
+        self.build = os.path.join(self.therock, "build")
+        os.makedirs(self.build)
+        with open(os.path.join(self.build, "subproject_map.json"), "w") as fh:
+            json.dump(FIXTURE, fh)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_cache(self, entries: dict[str, str]) -> None:
+        """Write a CMakeCache fixture; keys carry their cmake type, as the real
+        cache does (-D without a type lands as UNINITIALIZED)."""
+        with open(os.path.join(self.build, "CMakeCache.txt"), "w") as fh:
+            fh.write("# CMakeCache test fixture\n")
+            for name, value in entries.items():
+                fh.write(f"{name}={value}\n")
+
+    def _run(self, *flags: str) -> dict[str, str]:
+        backend = TheRockBackend()
+        args = make_args(self.therock, self.repos, *flags, "list")
+        env = backend.build_child_env(args)
+        backend._assert_build_testing_ok({"BUILD_DIR": self.build}, args)
+        return env
+
+    def test_default_configures_testing_off(self) -> None:
+        self.assertIn("-DTHEROCK_BUILD_TESTING=OFF", self._run()["SROCK_CMAKE_EXTRA"])
+
+    def test_build_tests_configures_testing_on(self) -> None:
+        env = self._run("--build-tests")
+        self.assertIn("-DTHEROCK_BUILD_TESTING=ON", env["SROCK_CMAKE_EXTRA"])
+
+    def test_unconfigured_tree_never_errors(self) -> None:
+        # No CMakeCache: no existing configuration to contradict, so either
+        # setting simply applies to the tree's first configure.
+        self.assertIsNone(TheRockBackend()._current_build_testing(self.build))
+        self._run()
+        self._run("--build-tests")
+
+    def test_enabling_without_reconfigure_is_an_error(self) -> None:
+        self._write_cache({"THEROCK_BUILD_TESTING:UNINITIALIZED": "OFF"})
+        with self.assertRaises(SystemExit):
+            self._run("--build-tests")
+
+    def test_enabling_with_reconfigure_is_allowed(self) -> None:
+        self._write_cache({"THEROCK_BUILD_TESTING:UNINITIALIZED": "OFF"})
+        env = self._run("--build-tests", "--reconfigure")
+        self.assertIn("-DTHEROCK_BUILD_TESTING=ON", env["SROCK_CMAKE_EXTRA"])
+
+    def test_matching_cache_is_idempotent_noop(self) -> None:
+        # Already configured the requested way -> no error without
+        # --reconfigure, in both directions.
+        self._write_cache({"THEROCK_BUILD_TESTING:UNINITIALIZED": "OFF"})
+        self._run()
+        self._write_cache({"THEROCK_BUILD_TESTING:UNINITIALIZED": "ON"})
+        self._run("--build-tests")
+
+    def test_dropping_build_tests_is_a_change(self) -> None:
+        # Configured with tests; omitting --build-tests turns them off, which is
+        # as much a change as enabling them.
+        self._write_cache({"THEROCK_BUILD_TESTING:UNINITIALIZED": "ON"})
+        with self.assertRaises(SystemExit):
+            self._run()
+
+    def test_tree_configured_without_the_var_is_unmanaged(self) -> None:
+        # A tree configured straight from setup_srock.sh (or before this option
+        # existed) runs on TheRock's ON default. It must not be reported as a
+        # change: that would demand a --reconfigure, wiping an existing build dir
+        # merely to stop building tests it was already building.
+        self._write_cache({
+            "CMAKE_BUILD_TYPE:STRING": "Release", "BUILD_TESTING:BOOL": "ON",
+        })
+        self.assertIsNone(TheRockBackend()._current_build_testing(self.build))
+        self._run()
+        self._run("--build-tests")
+
+    def test_cached_value_is_read_whatever_its_spelling(self) -> None:
+        for cached, expected in (("OFF", False), ("0", False), ("ON", True),
+                                 ("TRUE", True), ("1", True)):
+            self._write_cache({"THEROCK_BUILD_TESTING:UNINITIALIZED": cached})
+            self.assertIs(
+                TheRockBackend()._current_build_testing(self.build), expected,
+                f"cached THEROCK_BUILD_TESTING={cached}",
+            )
+
+
 class PrepareRunTest(unittest.TestCase):
     """Auto-pin / unpin wiring around buildctl.py (dry-run, no real build)."""
 

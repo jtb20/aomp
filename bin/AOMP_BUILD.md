@@ -837,6 +837,59 @@ and naming the same feature in both `--add` and `--remove` is an error.
 > `therock/install` still builds and installs it, because the minimal config
 > leaves it enabled in cmake.
 
+### Building test suites (`--build-tests`)
+
+Component test suites are **off by default** — the orchestrator always configures
+TheRock with `-DTHEROCK_BUILD_TESTING=OFF`, and `--build-tests` turns them on.
+This inverts TheRock's own default, which follows CTest's `BUILD_TESTING` and is
+therefore ON.
+
+The default is inverted because `THEROCK_BUILD_TESTING` does more than register
+`ctest` cases: it declares whole **test-only subprojects** (the worst being
+`rocPRIM_tests`, a second full configure+build of the rocprim tree with its
+template-heavy test suite) and enables benchmark builds. Those are reachable from
+the default build — `rocPRIM_tests` is a dependency of the `prim` artifact, which
+`dist-rocm` pulls into `ALL` — so they are built even when you never run a test.
+Against a Debug compiler they can dominate the whole build.
+
+```bash
+# Default: no test subprojects, no benchmarks.
+therock_build.py --reconfigure prim/build
+
+# Opt in when you actually intend to run the suites.
+therock_build.py --build-tests --reconfigure prim/build
+```
+
+Because it is a configure-time gate, `--build-tests` only takes hold on a
+(re)configure, and the flag is re-emitted on every configure (a reconfigure wipes
+the build dir, so an unrepeated value would silently revert to TheRock's ON
+default). Flipping the setting on an already-configured tree therefore needs
+`--reconfigure`; asking for a flip without it is a hard error rather than a silent
+no-op, in both directions — dropping `--build-tests` from a tree configured *with*
+tests turns them off, which is just as much a change as adding it:
+
+```
+therock_build.py --build-tests prim/build
+# error: --build-tests turns THEROCK_BUILD_TESTING on but the tree is
+#        configured without tests and no --reconfigure was given.
+#          Re-run with --reconfigure to apply it (...).
+```
+
+Leaving the flag as-is is a no-op, so `--build-tests` can stay on the command line
+across incremental builds.
+
+The comparison is against `THEROCK_BUILD_TESTING` in the **current
+`CMakeCache.txt`**, and a tree where that variable is absent is left *unmanaged*
+(same treatment `--build-type` gives a scope it did not set). So a tree configured
+straight from `setup_srock.sh`, or before this option existed, keeps building tests
+without complaint — the off-by-default only takes hold at its next configure. That
+avoids demanding a `--reconfigure`, which wipes the build dir, just to stop
+building tests the tree was already building.
+
+Note that individual libraries also have their own upstream `BUILD_TEST`-style
+options; `--build-tests` drives TheRock's umbrella variable, which is what those
+inherit.
+
 ### Leading pseudo-task (prereq toolchain)
 
 A `therock/prereq` pseudo-task is prepended **before** every per-subproject task.
@@ -1041,6 +1094,9 @@ libs that real components need are then pulled into the build by the default
 request closure. Because it changes the **configured** component set, it only
 takes effect at **(re)configure** time — pair `--add sysdeps` with
 `--reconfigure` to apply it (and regenerate `subproject_map.json`).
+
+Test suites are the other configure-time toggle defaulted off, but they *are* a
+real flag: see [`--build-tests`](#building-test-suites---build-tests).
 
 Like the aomp backend, the TheRock backend builds with an **isolated `PATH`**
 (the venv plus srock's supplemental `cmake`/`ninja` dirs are layered on top in

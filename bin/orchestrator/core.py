@@ -1197,6 +1197,14 @@ def add_backend_options(
              "closure is built too (e.g. rebuilding amd-llvm also rebuilds "
              "rocgdb).",
     )
+    group.add_argument(
+        "--build-tests", action="store_true",
+        help="build each component's test suites (THEROCK_BUILD_TESTING=ON). "
+             "Off by default: TheRock would otherwise build test-only "
+             "subprojects such as rocPRIM_tests, which dominate build time for "
+             "a Debug compiler. Being a configure-time gate, changing it needs "
+             "--reconfigure.",
+    )
 
     shard = parser.add_argument_group(
         "group-based sharding (--backend therock)"
